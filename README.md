@@ -40,3 +40,18 @@ llama-server -m /path/to/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
 複数の画面で地名表示や依頼票の名称を確かめた場合、`evidence.jsonl` の `screen_label` に読み取った表記を保存します。
 
 映像と中間画像の処理にはループバック上のモデルを使います。外部の辞書検索に使う情報は作品名・版・照会語です。[作品別辞書と OCR](docs/dictionary.md)・[実録画の採点方法](docs/evaluation.md)・[実録画による評価](docs/evaluation-results.md)・[vLLM の画像入力](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
+
+### Apple Silicon Mac で日本語の発話を使う
+
+FFmpeg と、ローカルに保存した MLX Whisper モデルを用意してください。実録画の評価では `kaiinui/kotoba-whisper-v2.0-mlx` を使いました。リポジトリのルートで以下を実行し、`GAMEPLAY_WHISPER_MODEL` に `config.json` と重みが入ったディレクトリを指定します。
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install 'mlx-whisper==0.4.3'
+export GAMEPLAY_WHISPER_MODEL="/path/to/kotoba-whisper-v2.0-mlx"
+export GAMEPLAY_TRANSCRIBER="$PWD/tools/transcribe-mlx.py"
+./target/release/gameplay-timestamps "ゲームタイトル" "/path/to/Part5.mp4"
+```
+
+アダプターは先頭の音声トラックを 16 kHz のモノラルに変換し、450秒ごとに前後2秒を添えて Mac 内で認識します。SRT の時刻は音声トラックの開始が遅い場合も録画の再生開始から数えます。全区間を処理すると標準出力に SRT を書き出します。字幕だけを保存するには `"$GAMEPLAY_TRANSCRIBER" "/path/to/Part5.mp4" > Part5.srt` を実行してください。
