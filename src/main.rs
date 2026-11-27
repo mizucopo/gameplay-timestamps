@@ -11,6 +11,7 @@ mod model;
 mod objective;
 mod observations;
 mod ocr;
+mod opponent;
 mod quest;
 mod scene;
 mod sheet;
@@ -138,7 +139,16 @@ fn generate(args: Args) -> Result<PathBuf> {
     speech::supplement(&analyzer, &video, &subtitles, &mut scan)?;
     let mut events = scan.events;
     editor::refine(&mut events, &model, &args.game);
+    let opponent_claims: Vec<_> = events.iter().map(opponent::needs_check).collect();
     captions::enrich(&mut events, &subtitles, &dictionary, &model, &args.game)?;
+    opponent::verify(
+        &mut events,
+        &subtitles,
+        &dictionary,
+        &analyzer,
+        &video,
+        &opponent_claims,
+    );
     // Keep the source opening until every later proof has had a chance to move
     // a provisional event away from zero. A meaningful zero-second event can
     // now stand in for the generic opening.

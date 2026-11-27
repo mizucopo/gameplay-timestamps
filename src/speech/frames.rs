@@ -8,7 +8,7 @@ use crate::media::{self, Frame};
 /// each target: an accurately input-trimmed seek could discard a picture that
 /// is still on screen during a VFR gap. FFmpeg names each JPEG by its output
 /// PTS, so missing video at the beginning or end never shifts another label.
-pub(super) fn sample(video: &Path, mut seconds: Vec<u64>) -> Result<BTreeMap<u64, Frame>> {
+pub(crate) fn sample(video: &Path, mut seconds: Vec<u64>) -> Result<BTreeMap<u64, Frame>> {
     seconds.sort_unstable();
     seconds.dedup();
     let tmp = tempfile::tempdir()?;

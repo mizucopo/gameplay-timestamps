@@ -478,6 +478,30 @@ impl Dictionary {
         (exact, aliases)
     }
 
+    /// Match the whole person named in an affirmative identification. A term
+    /// mentioned earlier in a sentence may be the speaker, an ally, or an owner.
+    pub fn identifies(&self, name: &str, identity: &str) -> bool {
+        let name = compact(name);
+        let identity = compact(identity);
+        if identity == name {
+            return true;
+        }
+        self.entries.iter().any(|term| {
+            let spellings = std::iter::once(&term.name).chain(&term.aliases);
+            spellings.clone().any(|spelling| compact(spelling) == name)
+                && term.supported(&identity)
+                && spellings.into_iter().any(|spelling| {
+                    let spelling = compact(spelling);
+                    identity == spelling
+                        || term.context.iter().any(|context| {
+                            identity.strip_suffix(&spelling).is_some_and(|prefix| {
+                                prefix.trim_end_matches('の') == compact(context)
+                            })
+                        })
+                })
+        })
+    }
+
     pub fn hints(&self, heading: &str, evidence: &Evidence) -> String {
         let (mut names, aliases) = self.grounded(&evidence.observed);
         for (alias, targets) in aliases {

@@ -1,5 +1,6 @@
 //! Exercise the public CLI, actual video timestamps and local model wire format.
 use anyhow::{Result, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -61,7 +62,42 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
             } else {
                 None
             };
-            let answer = if let Some((start, seen, heading, kind, basis)) = regression {
+            let answer = if prompt.contains("原寸の1コマ") {
+                ensure!(!prompt.contains("炎角の鳥") && !prompt.contains("古い実"));
+                let url = body["messages"][1]["content"][1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap();
+                let bytes =
+                    STANDARD.decode(url.strip_prefix("data:image/jpeg;base64,").unwrap())?;
+                let picture = image::load_from_memory(&bytes)?.to_rgb8();
+                ensure!(
+                    picture.dimensions() == (96, 54),
+                    "expected the original evidence image"
+                );
+                let [r, g, b] = picture.get_pixel(48, 27).0;
+                let properties = &body["response_format"]["json_schema"]["schema"]["properties"];
+                if properties.get("action").is_some() {
+                    ensure!(
+                        properties.get("subject").is_none(),
+                        "the combat stage has a separate reading"
+                    );
+                    json!({"action": if g > 140 && b > 140 { "guard" } else { "ongoing" }, "actor":"player"})
+                } else if r > 170 && g > 170 && b < 60 {
+                    json!({"subject":"result","literal":""})
+                } else if g > 90 && r < 60 && b < 60 {
+                    json!({"subject":"item","literal":"風見の実"})
+                } else if b > 160 && g < 50 {
+                    json!({"subject":"equipment","literal":""})
+                } else if g > 140 && b > 140 {
+                    json!({"subject":"boss_hud","literal":"蒼の騎士"})
+                } else {
+                    json!({"subject":"other","literal":""})
+                }
+            } else if prompt.contains("『敵役の検証』") && prompt.contains("対象ID") {
+                json!({"remove":[]})
+            } else if prompt.contains("『敵役の検証』") && prompt.contains("新規対象") {
+                json!({"events":[]})
+            } else if let Some((start, seen, heading, kind, basis)) = regression {
                 if prompt.contains("新規対象") {
                     let mut events = Vec::new();
                     if kind == "place" {
@@ -104,12 +140,16 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
             } else {
                 anyhow::bail!("unexpected request: {prompt}");
             };
-            ensure!(
-                body["messages"][1]["content"][1]["image_url"]["url"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("data:image/jpeg;base64,")
-            );
+            if prompt.contains("対象ID") {
+                ensure!(body["messages"][1]["content"].as_array().unwrap().len() == 1);
+            } else {
+                ensure!(
+                    body["messages"][1]["content"][1]["image_url"]["url"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:image/jpeg;base64,")
+                );
+            }
             let bytes = serde_json::to_vec(
                 &json!({"choices":[{"message":{"content":answer.to_string()}}]}),
             )?;
@@ -307,5 +347,181 @@ fn silent_recording_keeps_distinct_starts_and_links_later_evidence() -> Result<(
         std::net::TcpStream::connect(base.trim_start_matches("http://").trim_end_matches("/v1"))?;
     stop.write_all(b"GET /stop HTTP/1.1\r\n\r\n")?;
     assert_eq!(server.join().unwrap()?, 4);
+    Ok(())
+}
+
+#[test]
+fn cached_enemy_guesses_are_checked_at_their_original_frame_before_publication() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let video = tmp.path().join("scene.mp4");
+    let filter = "drawbox=color=green:t=fill:enable='between(t,2,3)',drawbox=color=blue:t=fill:enable='eq(t,4)',drawbox=color=cyan:t=fill:enable='gte(t,5)',drawbox=x=4:y=4:w=10:h=10:color=white:t=fill:enable='eq(t,2)',drawbox=color=yellow:t=fill:enable='eq(t,8)'";
+    ensure!(
+        Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=96x54:r=1:d=10",
+                "-vf",
+                filter,
+                "-an",
+                "-c:v",
+                "mpeg4"
+            ])
+            .arg(&video)
+            .status()?
+            .success()
+    );
+    let (base, server) = model()?;
+    let cache = tmp.path().join("cache");
+    let run = |name: &str| -> Result<()> {
+        let output = Command::new(env!("CARGO_BIN_EXE_gameplay-timestamps"))
+            .arg("敵役の検証")
+            .arg(&video)
+            .args([
+                "--api-base",
+                &base,
+                "--model",
+                "fixture",
+                "--search",
+                "off",
+                "--no-ocr",
+                "--no-audio",
+                "--inference-cache",
+            ])
+            .arg(&cache)
+            .arg("-o")
+            .arg(tmp.path().join(name))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    run("seed")?;
+    let obs = fs::read_dir(&cache)?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|p| p.file_name().to_string_lossy().starts_with("observations-"))
+        .unwrap()
+        .path();
+    // Model the observations persisted before the naming check existed.
+    ensure!(
+        Command::new("ffmpeg")
+            .args(["-nostdin", "-y", "-v", "error", "-i"])
+            .arg(&video)
+            .args(["-start_number", "0", "-q:v", "3"])
+            .arg(obs.join("frames/%08d.jpg"))
+            .status()?
+            .success()
+    );
+    let event = |start, seen, heading: &str, basis: &str, ocr: &str| {
+        json!({
+            "start":start,"seen":seen,"heading":heading,"basis":basis,"ocr":ocr,
+            "start_image":format!("frames/{start:08}.jpg"),"evidence_image":format!("frames/{seen:08}.jpg")
+        })
+    };
+    let mut verified = event(
+        7,
+        7,
+        "銀の怪鳥戦開始",
+        "2フレームの敵名と体力ゲージ",
+        "7 銀の怪鳥",
+    );
+    verified["screen_label"] = json!("銀の怪鳥");
+    let original = json!([
+        event(0, 0, "動画開始", "録画の先頭", ""),
+        event(0, 4, "ボス「炎角の鳥」登場", "翼を広げたような赤い衣装", ""),
+        event(0, 4, "炎角の鳥を撃破", "大きな装飾が消えた", ""),
+        event(1, 3, "「古い実」との戦闘開始", "大きな影が映る", ""),
+        event(
+            1,
+            3,
+            "依頼「古塔」進行中にボス「古い実」が出現",
+            "大きな影が映る",
+            ""
+        ),
+        event(
+            1,
+            3,
+            "探索中の敵遭遇",
+            "敵の名前「古い実」が出て戦い始める",
+            ""
+        ),
+        event(
+            3,
+            3,
+            "風見の実を入手",
+            "画面にアイテム取得表示",
+            "3 風見の実×3"
+        ),
+        event(3, 3, "石碑の発見", "石碑に文字が刻まれている", ""),
+        event(
+            5,
+            6,
+            "ボス「蒼の騎士」の攻撃をガード成功",
+            "敵の名前と攻撃・防御が見える",
+            "6 敵名：蒼の騎士"
+        ),
+        // Persisted events can be ordered by introduction, even when a
+        // rematch accidentally points to the guard in the previous battle.
+        event(
+            5,
+            9,
+            "ボス「蒼の騎士」の攻撃をガード成功",
+            "再戦の攻防",
+            "9 敵名：蒼の騎士"
+        ),
+        event(8, 8, "敵との戦闘に敗北", "結果画面の表示", "8 DEFEAT"),
+        verified,
+        event(7, 7, "白角のうさぎを倒す", "画面上の目的欄", ""),
+        event(
+            7,
+            7,
+            "依頼「探索中に敵と遭遇」を受注",
+            "新しい依頼が表示",
+            ""
+        ),
+        event(
+            7,
+            7,
+            "衛兵と敵との戦闘について話す",
+            "会話欄に話者と台詞を表示",
+            ""
+        ),
+    ]);
+    let bytes = serde_json::to_vec(&original)?;
+    fs::write(obs.join("events.json"), &bytes)?;
+    for dest in ["corrected", "repeat"] {
+        run(dest)?;
+        let path = tmp.path().join(dest);
+        assert_eq!(
+            fs::read_to_string(path.join("timestamps.txt"))?,
+            "0:00 動画開始\n0:03 風見の実を入手\n0:03 石碑の発見\n0:04 装備のクローズアップ\n0:05 ボス「蒼の騎士」の攻撃をガード成功\n0:07 銀の怪鳥戦開始\n0:07 白角のうさぎを倒す\n0:07 依頼「探索中に敵と遭遇」を受注\n0:07 衛兵と敵との戦闘について話す\n0:08 戦闘に敗北\n0:09 ボス「蒼の騎士」の攻撃をガード成功\n"
+        );
+        let raw = fs::read_to_string(path.join("evidence.jsonl"))?;
+        assert!(!raw.contains("炎角の鳥") && !raw.contains("古い実"));
+        let rows = raw
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        assert_eq!(rows[3]["start_image"], rows[3]["evidence_image"]);
+        assert_eq!(rows[3]["seen"], 4);
+        assert_eq!(rows[4]["start_image"], "frames/00000005.jpg");
+        assert_eq!(rows[4]["evidence_image"], "frames/00000006.jpg");
+        assert_eq!(rows.last().unwrap()["start_image"], "frames/00000009.jpg");
+        assert_eq!(fs::read(obs.join("events.json"))?, bytes);
+    }
+    let mut stop =
+        std::net::TcpStream::connect(base.trim_start_matches("http://").trim_end_matches("/v1"))?;
+    stop.write_all(b"GET /stop HTTP/1.1\r\n\r\n")?;
+    // The guard is the only event needing a separate combat-stage reading.
+    // The cached proof and onset may be identical after MPEG compression.
+    assert!((7..=11).contains(&server.join().unwrap()?));
     Ok(())
 }

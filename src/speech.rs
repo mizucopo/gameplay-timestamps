@@ -1,6 +1,6 @@
 //! Timed language can nominate a moment missed by the full visual scan. Only a
 //! second, image-based observation can add an event or move its introduction.
-mod frames;
+pub(crate) mod frames;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
