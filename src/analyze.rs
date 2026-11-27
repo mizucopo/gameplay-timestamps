@@ -809,7 +809,9 @@ proposal は仮説。根拠秒にそれが本当に起きたかを画像で検�
                     // A label from the preceding shot is a separate event.
                     self.verified.contains(id)
                         && (e.start..=e.start.saturating_add(2)).contains(&event.start)
-                        && (e.seen..=e.seen.saturating_add(3)).contains(&event.seen)
+                        // The skip prompt that identified the shot can appear
+                        // after the scene's name is already visible.
+                        && (e.start..=e.seen.saturating_add(3)).contains(&event.seen)
                         && ((e.heading == "プレイ再開"
                             && c.can_be_resumption()
                             && is_resume_heading(&event.heading))

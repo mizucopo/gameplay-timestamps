@@ -45,10 +45,15 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
                 Some((0, 5, "依頼「灯台の配達」", "quest", "画面上の依頼を確認"))
             } else if prompt.contains("『再開の検証』") {
                 Some((6, 8, "橋の修理の依頼を再開", "quest", "画面上の依頼を確認"))
-            } else if prompt.contains("『地名の検証』") {
+            } else if prompt.contains("『地名の検証』") || prompt.contains("『早い地名の検証』")
+            {
                 Some((
                     2,
-                    6,
+                    if prompt.contains("『早い地名の検証』") {
+                        3
+                    } else {
+                        6
+                    },
                     "宝石宮殿の紹介",
                     "place",
                     "画面に地名「宝石宮殿」が表示された",
@@ -140,14 +145,17 @@ if os.environ["TEST_SCENE"] == "先頭の検証" and rgb[2] > 120:
 elif os.environ["TEST_SCENE"] == "再開の検証":
     if rgb[2] > 120: print("ロード スロット")
     if rgb[1] > 85: print("橋の修理の依頼を再開")
-elif os.environ["TEST_SCENE"] == "地名の検証":
+elif os.environ["TEST_SCENE"] in ("地名の検証", "早い地名の検証"):
     if rgb[0] > 185 and rgb[1] > 185: print("旧市街\nマップ")
     elif 140 < rgb[0] < 180 and 140 < rgb[1] < 180: print("スキップ")
-    elif rgb[2] > 150 and rgb[0] < 80: print("宝石宮殿")
+    elif (35 < rgb[0] < 65 and 35 < rgb[1] < 65) or (rgb[2] > 150 and rgb[0] < 80):
+        print("宝石宮殿")
 "#,
     )?;
     fs::set_permissions(&ocr, fs::Permissions::from_mode(0o755))?;
     let (base, server) = model()?;
+    let palace_scene = "drawbox=color=0xc8c8c8:t=fill,drawbox=color=0x646464:t=fill:enable='eq(t,2)',drawbox=color=0x303030:t=fill:enable='eq(t,3)',drawbox=color=0xa0a0a0:t=fill:enable='between(t,4,5)',drawbox=color=blue:t=fill:enable='gte(t,6)'";
+    let palace_headings = "0:00 動画開始\n0:01 旧市街の紹介\n0:02 宝石宮殿の紹介\n";
     for (game, filter, expected) in [
         (
             "先頭の検証",
@@ -159,11 +167,8 @@ elif os.environ["TEST_SCENE"] == "地名の検証":
             "drawbox=color=blue:t=fill:enable='lte(t,2)',drawbox=color=black:t=fill:enable='between(t,3,4)',drawbox=color=green:t=fill:enable='gte(t,5)'",
             "0:00 動画開始\n0:05 プレイ再開\n0:06 橋の修理の依頼を再開\n",
         ),
-        (
-            "地名の検証",
-            "drawbox=color=0xc8c8c8:t=fill,drawbox=color=0x646464:t=fill:enable='eq(t,2)',drawbox=color=black:t=fill:enable='eq(t,3)',drawbox=color=0xa0a0a0:t=fill:enable='between(t,4,5)',drawbox=color=blue:t=fill:enable='gte(t,6)'",
-            "0:00 動画開始\n0:01 旧市街の紹介\n0:02 宝石宮殿の紹介\n",
-        ),
+        ("地名の検証", palace_scene, palace_headings),
+        ("早い地名の検証", palace_scene, palace_headings),
     ] {
         let video = tmp.path().join(format!("{game}.mp4"));
         ensure!(
@@ -211,7 +216,12 @@ elif os.environ["TEST_SCENE"] == "地名の検証":
             String::from_utf8_lossy(&result.stderr)
         );
         assert_eq!(fs::read_to_string(out.join("timestamps.txt"))?, expected);
-        if game == "地名の検証" {
+        if game.ends_with("地名の検証") {
+            let seen = if game == "早い地名の検証" {
+                3
+            } else {
+                6
+            };
             let data = fs::read_to_string(out.join("evidence.jsonl"))?;
             let old_town: Value = serde_json::from_str(data.lines().nth(1).unwrap())?;
             assert_eq!(old_town["start"], 1);
@@ -219,8 +229,8 @@ elif os.environ["TEST_SCENE"] == "地名の検証":
             assert_eq!(old_town["evidence_image"], "frames/00000001.jpg");
             let place: Value = serde_json::from_str(data.lines().nth(2).unwrap())?;
             assert_eq!(place["start_image"], "frames/00000002.jpg");
-            assert_eq!(place["seen"], 6);
-            assert_eq!(place["evidence_image"], "frames/00000006.jpg");
+            assert_eq!(place["seen"], seen);
+            assert_eq!(place["evidence_image"], format!("frames/{seen:08}.jpg"));
             assert!(place["ocr"].as_str().unwrap().contains("宝石宮殿"));
         }
     }
