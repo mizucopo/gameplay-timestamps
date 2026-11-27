@@ -6,3 +6,14 @@ description = "\u30b2\u30fc\u30e0\u30bf\u30a4\u30c8\u30eb\u3068\u30d7\u30ec\u30a
 authors = ["\u307f\u305a"]
 
 [dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
