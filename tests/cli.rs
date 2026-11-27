@@ -58,12 +58,27 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
             };
             let answer = if let Some((start, seen, heading, kind, basis)) = regression {
                 if prompt.contains("新規対象") {
-                    json!({"events":[{"start":start,"seen":seen,"heading":heading,"kind":kind}]})
+                    let mut events = Vec::new();
+                    if kind == "place" {
+                        events.push(
+                            json!({"start":1,"seen":1,"heading":"旧市街の紹介","kind":"place"}),
+                        );
+                    }
+                    events.push(json!({"start":start,"seen":seen,"heading":heading,"kind":kind}));
+                    json!({"events":events})
                 } else if prompt.contains("スキップ可能な演出に切り替わりました")
                 {
                     json!({"kind":"location","picture":"建物の全景が見える"})
                 } else if prompt.contains("個々の台詞") {
-                    json!({"events":[{"id":0,"start":start,"heading":heading,"basis":basis}]})
+                    let events = if kind == "place" {
+                        vec![
+                            json!({"id":0,"start":1,"heading":"旧市街の紹介","basis":"旧市街の地名が表示された"}),
+                            json!({"id":1,"start":start,"heading":heading,"basis":basis}),
+                        ]
+                    } else {
+                        vec![json!({"id":0,"start":start,"heading":heading,"basis":basis})]
+                    };
+                    json!({"events":events})
                 } else {
                     anyhow::bail!("unexpected request: {prompt}");
                 }
@@ -126,7 +141,7 @@ elif os.environ["TEST_SCENE"] == "再開の検証":
     if rgb[2] > 120: print("ロード スロット")
     if rgb[1] > 85: print("橋の修理の依頼を再開")
 elif os.environ["TEST_SCENE"] == "地名の検証":
-    if rgb[0] > 185 and rgb[1] > 185: print("マップ")
+    if rgb[0] > 185 and rgb[1] > 185: print("旧市街\nマップ")
     elif 140 < rgb[0] < 180 and 140 < rgb[1] < 180: print("スキップ")
     elif rgb[2] > 150 and rgb[0] < 80: print("宝石宮殿")
 "#,
@@ -147,7 +162,7 @@ elif os.environ["TEST_SCENE"] == "地名の検証":
         (
             "地名の検証",
             "drawbox=color=0xc8c8c8:t=fill,drawbox=color=0x646464:t=fill:enable='eq(t,2)',drawbox=color=black:t=fill:enable='eq(t,3)',drawbox=color=0xa0a0a0:t=fill:enable='between(t,4,5)',drawbox=color=blue:t=fill:enable='gte(t,6)'",
-            "0:00 動画開始\n0:02 宝石宮殿の紹介\n",
+            "0:00 動画開始\n0:01 旧市街の紹介\n0:02 宝石宮殿の紹介\n",
         ),
     ] {
         let video = tmp.path().join(format!("{game}.mp4"));
@@ -198,7 +213,11 @@ elif os.environ["TEST_SCENE"] == "地名の検証":
         assert_eq!(fs::read_to_string(out.join("timestamps.txt"))?, expected);
         if game == "地名の検証" {
             let data = fs::read_to_string(out.join("evidence.jsonl"))?;
-            let place: Value = serde_json::from_str(data.lines().nth(1).unwrap())?;
+            let old_town: Value = serde_json::from_str(data.lines().nth(1).unwrap())?;
+            assert_eq!(old_town["start"], 1);
+            assert_eq!(old_town["seen"], 1);
+            assert_eq!(old_town["evidence_image"], "frames/00000001.jpg");
+            let place: Value = serde_json::from_str(data.lines().nth(2).unwrap())?;
             assert_eq!(place["start_image"], "frames/00000002.jpg");
             assert_eq!(place["seen"], 6);
             assert_eq!(place["evidence_image"], "frames/00000006.jpg");

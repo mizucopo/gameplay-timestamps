@@ -803,15 +803,21 @@ proposal は仮説。根拠秒にそれが本当に起きたかを画像で検�
             };
             if let Some(id) = earlier {
                 self.events[id] = event;
-            } else if let Some(anchor) = self.events.iter_mut().find(|e| {
-                e.start.abs_diff(event.start) <= 2
-                    && e.seen.abs_diff(event.seen) <= 3
-                    && ((e.heading == "プレイ再開"
-                        && c.can_be_resumption()
-                        && is_resume_heading(&event.heading))
-                        || (matches!(c.kind, Some(Kind::Place)) && e.heading == "場所紹介")
-                        || (matches!(c.kind, Some(Kind::Story)) && e.heading == "会話シーン開始"))
-            }) {
+            } else if let Some((_, anchor)) =
+                self.events.iter_mut().enumerate().rev().find(|(id, e)| {
+                    // A detail can refine the transition we have already seen.
+                    // A label from the preceding shot is a separate event.
+                    self.verified.contains(id)
+                        && (e.start..=e.start.saturating_add(2)).contains(&event.start)
+                        && (e.seen..=e.seen.saturating_add(3)).contains(&event.seen)
+                        && ((e.heading == "プレイ再開"
+                            && c.can_be_resumption()
+                            && is_resume_heading(&event.heading))
+                            || (matches!(c.kind, Some(Kind::Place)) && e.heading == "場所紹介")
+                            || (matches!(c.kind, Some(Kind::Story))
+                                && e.heading == "会話シーン開始"))
+                })
+            {
                 if anchor.heading != "プレイ再開" {
                     *anchor = Event {
                         start: anchor.start,
