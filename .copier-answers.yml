@@ -1,0 +1,21 @@
+_commit: 4208ae0
+_src_path: git@github.com:mizucopo/repo-template.git
+author_email: mizu.copo@gmail.com
+author_name: みず
+project_description: ゲームタイトルとプレイ動画から、YouTube の概要欄に貼れる日本語タイムスタンプを生成するプロジェクト。
+project_name: gameplay-timestamps
+project_version: 0.1.0
+rust_version: stable
+use_chrome_extension: false
+use_dependabot_github_actions: true
+use_docker: false
+use_gh_actions_bandit: false
+use_gh_actions_cargo_audit: false
+use_gh_actions_codeql: false
+use_gh_actions_release: false
+use_mit_license: false
+use_python: false
+use_rust: true
+use_tauri: false
+use_version_management: true
+repo_template_tauri_branding_assets_created: false
