@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::LazyLock;
 
+use anyhow::Result;
 use image::{ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
 use regex::Regex;
 
@@ -25,11 +26,11 @@ enum Region {
     CenterTitle,
 }
 
-fn read(frame: &Frame, region: Region, command: Option<&Path>) -> Option<String> {
+fn read(frame: &Frame, region: Region, command: Option<&Path>) -> Result<String> {
     if region == Region::Full {
-        return crate::ocr::read(&frame.jpeg, command).ok();
+        return crate::ocr::read(&frame.jpeg, command);
     }
-    let image = image::load_from_memory_with_format(&frame.jpeg, ImageFormat::Jpeg).ok()?;
+    let image = image::load_from_memory_with_format(&frame.jpeg, ImageFormat::Jpeg)?;
     let (w, h) = (image.width(), image.height());
     let (x, y, width, height, zoom, upscale_limit) = match region {
         Region::Objective => (w / 12, h * 3 / 5, w - 2 * (w / 12), h - h * 3 / 5, 2, 1700),
@@ -38,7 +39,7 @@ fn read(frame: &Frame, region: Region, command: Option<&Path>) -> Option<String>
         Region::Full => unreachable!(),
     };
     if width == 0 || height == 0 {
-        return None;
+        return Ok(String::new());
     }
     let new_width = (width * zoom).min(upscale_limit);
     let crop = image.crop_imm(x, y, width, height).resize_exact(
@@ -47,10 +48,8 @@ fn read(frame: &Frame, region: Region, command: Option<&Path>) -> Option<String>
         FilterType::Lanczos3,
     );
     let mut jpeg = Vec::new();
-    JpegEncoder::new_with_quality(&mut jpeg, 92)
-        .encode_image(&crop.unsharpen(1.0, 2))
-        .ok()?;
-    crate::ocr::read(&jpeg, command).ok()
+    JpegEncoder::new_with_quality(&mut jpeg, 92).encode_image(&crop.unsharpen(1.0, 2))?;
+    crate::ocr::read(&jpeg, command)
 }
 
 fn compact(line: &str) -> String {
@@ -186,9 +185,17 @@ pub fn identify(
     frames: &VecDeque<Frame>,
     words: &BTreeMap<u64, String>,
     ocr_command: Option<&Path>,
+    complete: &mut bool,
 ) -> Option<LocationIntro> {
     identify_with(start, until, frames, words, |f, region| {
         read(f, region, ocr_command)
+            .inspect_err(|error| {
+                if *complete {
+                    eprintln!("現在地の追加 OCR を読み取れません ({error})");
+                }
+                *complete = false;
+            })
+            .ok()
     })
 }
 
@@ -483,5 +490,38 @@ mod tests {
             .is_none()
         );
         assert!(reads <= 15, "{reads} OCR calls");
+    }
+
+    #[test]
+    fn failed_region_read_marks_the_scan_incomplete_without_stopping_it() -> Result<()> {
+        let mut complete = true;
+        let screens = words(&[(9, "目的地：霧の森へ向かう"), (10, "霧の森へ向かう")]);
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg).encode_image(&image::RgbImage::new(32, 24))?;
+        let frames = (0..26)
+            .map(|second| Frame {
+                second,
+                jpeg: jpeg.clone(),
+            })
+            .collect();
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("unavailable-ocr");
+        assert!(identify(15, 25, &frames, &screens, Some(&missing), &mut complete).is_none());
+        assert!(!complete);
+
+        let mut complete = true;
+        assert!(
+            identify(
+                15,
+                25,
+                &frames,
+                &BTreeMap::new(),
+                Some(&missing),
+                &mut complete
+            )
+            .is_none()
+        );
+        assert!(complete);
+        Ok(())
     }
 }

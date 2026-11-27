@@ -135,6 +135,15 @@ fn generate(args: Args) -> Result<PathBuf> {
     speech::supplement(&analyzer, &video, &subtitles, &mut events)?;
     editor::refine(&mut events, &model, &args.game);
     captions::enrich(&mut events, &subtitles, &dictionary, &model, &args.game)?;
+    // Keep the source opening until every later proof has had a chance to move
+    // a provisional event away from zero. A meaningful zero-second event can
+    // now stand in for the generic opening.
+    if events
+        .iter()
+        .any(|e| e.start == 0 && e.heading != "動画開始")
+    {
+        events.retain(|e| !(e.start == 0 && e.heading == "動画開始" && e.basis == "録画の先頭"));
+    }
     let mut timestamps = BufWriter::new(File::create(work.path().join("timestamps.txt"))?);
     let mut evidence = BufWriter::new(File::create(work.path().join("evidence.jsonl"))?);
     for event in &events {

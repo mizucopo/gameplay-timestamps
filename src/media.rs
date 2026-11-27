@@ -69,7 +69,7 @@ fn probe(video: &Path, only_video: bool) -> Result<Probe> {
     serde_json::from_slice(&output.stdout).context("ffprobe の出力を読み取れません")
 }
 
-fn ffmpeg_input(video: &Path) -> Command {
+fn ffmpeg() -> Command {
     let mut cmd = Command::new("ffmpeg");
     cmd.args([
         "-nostdin",
@@ -78,37 +78,113 @@ fn ffmpeg_input(video: &Path) -> Command {
         "-xerror",
         "-protocol_whitelist",
         "file,pipe",
-        "-i",
-    ])
-    .arg(video);
+    ]);
     cmd
 }
 
-/// Sample the screen displayed at each interval from the first video PTS.
-/// FPS conversion uses presentation times, so a held VFR image remains
-/// visible until the new image's PTS. A video track beginning after audio
-/// retains that delay in the returned whole seconds.
+fn ffmpeg_input(video: &Path) -> Command {
+    let mut cmd = ffmpeg();
+    cmd.arg("-i").arg(video);
+    cmd
+}
+
+pub const PLAYBACK_FPS: &str = "fps=1:round=up:eof_action=pass";
+pub const FRAME_SCALE: &str = "scale=w='min(iw,1920)':h='min(ih,1920)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+
+pub fn playback_input(video: &Path, seek: Option<u64>) -> Command {
+    let mut cmd = ffmpeg();
+    cmd.args(["-copyts", "-start_at_zero"]);
+    if let Some(second) = seek {
+        cmd.args(["-noaccurate_seek", "-ss", &second.to_string()]);
+    }
+    cmd.arg("-i").arg(video);
+    cmd
+}
+
+// The multipart JPEG stream has no PTS. Read the first filtered output PTS
+// once, in seconds, before streaming a delayed track. Container start_time
+// metadata can be absent or rounded and need not identify a displayed frame.
+fn first_playback_second(video: &Path) -> Result<u64> {
+    let output = playback_input(video, None)
+        .args([
+            "-map",
+            "0:V:0",
+            "-vf",
+            &format!("{PLAYBACK_FPS},trim=start=0,scale=2:2"),
+            "-frames:v",
+            "1",
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "1:1",
+            "-c:v",
+            "rawvideo",
+            "-f",
+            "framecrc",
+            "pipe:1",
+        ])
+        .output()
+        .context("映像の最初の再生秒を取得できません")?;
+    ensure!(
+        output.status.success(),
+        "ffmpeg: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    // framecrc columns: stream, DTS, PTS, duration, size, CRC.
+    let info = std::str::from_utf8(&output.stdout)?;
+    let row = info
+        .lines()
+        .find(|s| !s.starts_with('#') && !s.trim().is_empty())
+        .context("整数の再生秒に表示される映像フレームがありません")?;
+    row.split(',')
+        .nth(2)
+        .context("映像フレームの PTS がありません")?
+        .trim()
+        .parse()
+        .context("映像フレームの PTS を読み取れません")
+}
+
+/// Sample the screen at the first whole playback second containing video and
+/// every step seconds thereafter. A held VFR picture remains on screen until
+/// the following source PTS.
 pub fn scan(video: &Path, step: u32, mut on_frame: impl FnMut(Frame) -> Result<()>) -> Result<()> {
     ensure!(step > 0, "映像の走査間隔は 1 秒以上にしてください");
     let info = probe(video, true)?;
     let stream = info.streams.first().context("映像トラックがありません")?;
-    // ffprobe reports start_time in microseconds. Subtract in that unit so
-    // a one-second delay cannot round just below the second boundary.
-    let micros = |raw: &Option<String>| {
-        let seconds = raw.as_deref()?.parse::<f64>().ok()?;
-        Some((seconds * 1_000_000.0).round() as i64)
+    let (mut decoder, filter, first_second) = if stream.start_time == info.format.start_time
+        && stream
+            .start_time
+            .as_deref()
+            .is_some_and(|value| value.parse::<f64>().is_ok_and(f64::is_finite))
+    {
+        // At the playback origin the stream-relative and absolute grids agree.
+        (
+            ffmpeg_input(video),
+            format!(
+                "setpts=PTS-STARTPTS,fps=1/{step}:start_time=0:round=up:eof_action=pass,{FRAME_SCALE}"
+            ),
+            0,
+        )
+    } else {
+        // Run the same integer-second filter as sparse seeks before selecting
+        // the requested stride. Do not pad a missing first or last picture.
+        let first = first_playback_second(video)?;
+        let mut decoder = playback_input(video, None);
+        decoder.args([
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "1:1",
+            "-pix_fmt",
+            "yuvj420p",
+        ]);
+        (
+            decoder,
+            format!("{PLAYBACK_FPS},trim=start=0,select='not(mod(n,{step}))',{FRAME_SCALE}"),
+            first,
+        )
     };
-    let origin = micros(&info.format.start_time).unwrap_or_default();
-    let first_second = micros(&stream.start_time)
-        .unwrap_or(origin)
-        .saturating_sub(origin)
-        .max(0) as u64
-        / 1_000_000;
-    let filter = format!(
-        "setpts=PTS-STARTPTS,fps=1/{step}:start_time=0:round=up:eof_action=pass,\
-         scale=w='min(iw,1920)':h='min(ih,1920)':force_original_aspect_ratio=decrease:force_divisible_by=2"
-    );
-    let mut child = ffmpeg_input(video)
+    let mut child = decoder
         .args([
             "-map", "0:V:0", "-vf", &filter, "-c:v", "mjpeg", "-q:v", "3", "-f", "mpjpeg", "pipe:1",
         ])
@@ -486,7 +562,7 @@ mod tests {
             times.push(frame.second);
             Ok(())
         })?;
-        assert_eq!(times, [1, 2, 3]);
+        assert_eq!(times, [2, 3]); // The first video PTS is 1.25; at 1 s only audio is playing.
         let expected = vec![Cue {
             start: 0.8,
             end: 1.3,

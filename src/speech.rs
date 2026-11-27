@@ -266,13 +266,7 @@ fn verify(
             screen_label: None,
             ocr: String::new(),
         };
-        if c.start == 0
-            && let Some(opening) = events.iter_mut().find(|e| e.heading == "動画開始")
-        {
-            *opening = event;
-        } else {
-            events.push(event);
-        }
+        events.push(event);
     }
     Ok(())
 }

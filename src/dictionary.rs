@@ -39,6 +39,49 @@ pub struct Dictionary {
 
 type Spellings<'a> = BTreeMap<&'a str, BTreeSet<&'a str>>;
 
+/// OCR at the event's proof frame, its visual description, and adjacent OCR for glyph checks.
+pub struct Evidence {
+    pub ocr: String,
+    observed: String,
+    adjacent: String,
+}
+
+impl Evidence {
+    pub fn new(seen: u64, ocr: &str, basis: &str) -> Self {
+        let mut frames = BTreeMap::<u64, String>::new();
+        let mut second = seen; // Older and single-frame observations may have no time labels.
+        for line in ocr.lines() {
+            let text = if let Some((label, text)) = line.split_once(' ')
+                && let Ok(time) = label.parse::<u64>()
+            {
+                second = time;
+                text
+            } else {
+                line
+            };
+            if second.abs_diff(seen) <= 1 {
+                let frame = frames.entry(second).or_default();
+                if !frame.is_empty() {
+                    frame.push('\n');
+                }
+                frame.push_str(text);
+            }
+        }
+        let ocr = frames.remove(&seen).unwrap_or_default();
+        let observed = format!("{}\n{}", compact(&ocr), compact(basis));
+        let adjacent = frames
+            .into_values()
+            .map(|text| compact(&text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            ocr,
+            observed,
+            adjacent,
+        }
+    }
+}
+
 const TOPICS: [(&str, &str); 2] = [
     ("official", "公式サイト 登場人物 ワールド 地名 施設"),
     ("guide", "攻略 クエスト 依頼 ボス 形態 名前"),
@@ -420,11 +463,10 @@ impl Term {
 
 impl Dictionary {
     fn grounded<'a>(&'a self, evidence: &str) -> (BTreeSet<&'a str>, Spellings<'a>) {
-        let evidence = compact(evidence);
         let mut exact = BTreeSet::new();
         let mut aliases: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for term in &self.entries {
-            if term.supported(&evidence) {
+            if term.supported(evidence) {
                 if evidence.contains(&compact(&term.name)) {
                     exact.insert(term.name.as_str());
                 }
@@ -436,25 +478,40 @@ impl Dictionary {
         (exact, aliases)
     }
 
-    pub fn hints(&self, evidence: &str) -> String {
-        let (mut names, aliases) = self.grounded(evidence);
-        for unique in aliases.values().filter(|targets| targets.len() == 1) {
-            names.extend(unique);
+    pub fn hints(&self, heading: &str, evidence: &Evidence) -> String {
+        let (mut names, aliases) = self.grounded(&evidence.observed);
+        for (alias, targets) in aliases {
+            if targets.len() == 1 {
+                let target = *targets.first().unwrap();
+                let mut matches = heading.match_indices(alias).peekable();
+                if matches.peek().is_none()
+                    || matches.any(|(i, _)| {
+                        !inside_read_name(heading, i, alias, target, &evidence.observed)
+                    })
+                {
+                    names.insert(target);
+                }
+            }
         }
         names.into_iter().take(32).collect::<Vec<_>>().join("、")
     }
 
-    pub fn resolve(&self, heading: &str, evidence: &str) -> String {
+    pub fn resolve(&self, heading: &str, evidence: &Evidence) -> String {
         if self.entries.is_empty() {
             return heading.to_owned();
         }
-        let (exact, mut replacements) = self.grounded(evidence);
-        let evidence = compact(evidence);
+        let (mut exact, mut replacements) = self.grounded(&evidence.observed);
         for term in &self.entries {
+            // A spelling seen one frame away can corroborate a mistyped glyph, but cannot
+            // select a boss form or supply context for expanding a shared alias.
+            if evidence.adjacent.contains(&compact(&term.name)) {
+                exact.insert(&term.name);
+            }
             if !term.context.is_empty()
-                && !term.supported(&evidence)
+                && !term.supported(&evidence.observed)
                 && let Some(base) = term.aliases.iter().find(|alias| {
-                    term.name.ends_with(alias.as_str()) && evidence.contains(&compact(alias))
+                    term.name.ends_with(alias.as_str())
+                        && evidence.observed.contains(&compact(alias))
                 })
             {
                 // An unconfirmed epithet can be replaced by a witnessed form or the witnessed base name.
@@ -480,11 +537,15 @@ impl Dictionary {
                 .filter(|(word, _)| rest.starts_with(**word))
                 .max_by_key(|(word, _)| word.len())
             {
-                let target = if targets.len() == 1 {
-                    targets.first().copied().unwrap()
-                } else {
-                    word
-                };
+                let at = heading.len() - rest.len();
+                let target = targets
+                    .first()
+                    .copied()
+                    .filter(|target| {
+                        targets.len() == 1
+                            && !inside_read_name(heading, at, word, target, &evidence.observed)
+                    })
+                    .unwrap_or(word);
                 result.push_str(target);
                 rest = &rest[word.len()..];
                 continue;
@@ -504,6 +565,36 @@ impl Dictionary {
             }
         }
         result
+    }
+}
+
+/// Do not expand a short alias inside a longer name that the heading and screen already
+/// agree on, even when the longer name has no dictionary entry of its own.
+fn inside_read_name(heading: &str, at: usize, alias: &str, target: &str, observed: &str) -> bool {
+    let after = at + alias.len();
+    observed.match_indices(alias).any(|(i, _)| {
+        (!target.starts_with(alias)
+            && same_name_edge(heading[..at].chars().rev(), observed[..i].chars().rev()))
+            || (!target.ends_with(alias)
+                && same_name_edge(
+                    heading[after..].chars(),
+                    observed[i + alias.len()..].chars(),
+                ))
+    })
+}
+
+fn same_name_edge(
+    heading: impl Iterator<Item = char>,
+    mut screen: impl Iterator<Item = char>,
+) -> bool {
+    let mut heading = heading.filter(|c| !c.is_whitespace());
+    match (heading.next(), screen.next()) {
+        // A kana particle or name separator alone is not evidence of a shared qualifier.
+        (Some(a), Some(b)) if a == b && matches!(a, 'ぁ'..='ゖ' | '・' | '-' | '＝') => {
+            matches!((heading.next(), screen.next()), (Some(a), Some(b)) if a == b && a.is_alphanumeric())
+        }
+        (Some(a), Some(b)) => a == b && a.is_alphanumeric(),
+        _ => false,
     }
 }
 
@@ -549,6 +640,10 @@ fn confused_prefix(text: &str, name: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn frame(text: &str) -> Evidence {
+        Evidence::new(0, text, "")
+    }
+
     #[test]
     fn only_sources_for_the_requested_game_and_edition_are_used() {
         let response = json!({"web":{"results":[
@@ -568,10 +663,14 @@ mod tests {
         assert_eq!(term.aliases, ["紅苑"]);
         let dictionary = Dictionary { entries };
         assert_eq!(
-            dictionary.resolve("紅苑に到着", "場所：紅苑"),
+            dictionary.resolve("紅苑に到着", &frame("場所：紅苑")),
             "赤の植物園に到着"
         );
-        assert!(dictionary.hints("酒場を出る").is_empty());
+        assert!(
+            dictionary
+                .hints("酒場を出る", &frame("酒場を出る"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -585,29 +684,32 @@ mod tests {
             entries: extract(&response, "tavily", game, ""),
         };
         assert_eq!(
-            dictionary.resolve("カイフリード戦", "ボス：カイフリード"),
+            dictionary.resolve("カイフリード戦", &frame("ボス：カイフリード")),
             "カイフリード戦"
         );
         assert_eq!(
-            dictionary.resolve("カイフリード戦", "ボス：カイフリード　称号：反逆者"),
+            dictionary.resolve("カイフリード戦", &frame("ボス：カイフリード　称号：反逆者")),
             "反逆者カイフリード戦"
         );
         assert_eq!(
-            dictionary.resolve("反逆者カイフリード戦", "開闢の憎悪　カイフリード"),
+            dictionary.resolve("反逆者カイフリード戦", &frame("開闢の憎悪　カイフリード")),
             "開闢の憎悪カイフリード戦"
         );
         assert_eq!(
-            dictionary.resolve("反逆者カイフリード戦", "カイフリード"),
+            dictionary.resolve("反逆者カイフリード戦", &frame("カイフリード")),
             "カイフリード戦"
         );
         assert_eq!(
-            dictionary.resolve("開闢の憎悪カイフリード戦", "開闢の憎悪 カイフリード"),
+            dictionary.resolve(
+                "開闢の憎悪カイフリード戦",
+                &frame("開闢の憎悪 カイフリード")
+            ),
             "開闢の憎悪カイフリード戦"
         );
         assert_eq!(
             dictionary.resolve(
                 "カイフリード戦",
-                "反逆者カイフリード と 開闢の憎悪カイフリード"
+                &frame("反逆者カイフリード と 開闢の憎悪カイフリード")
             ),
             "カイフリード戦"
         );
@@ -625,15 +727,77 @@ mod tests {
         };
         let heading = "目標2 アルホール植物園の探索";
         assert_eq!(
-            dictionary.resolve(heading, "目標欄：アルホール植物園"),
+            dictionary.resolve(heading, &frame("目標欄：アルホール植物園")),
             heading
         );
         assert_eq!(
             dictionary.resolve(
                 heading,
-                "目標欄：アル ホール植物園\n場所表示：アル ボール 植物園"
+                &Evidence::new(
+                    27,
+                    "27 目標欄：アル ホール植物園\n28 場所表示：アル ボール 植物園",
+                    ""
+                )
             ),
             "目標2 アルボール植物園の探索"
+        );
+        assert_eq!(
+            dictionary.resolve(
+                heading,
+                &Evidence::new(
+                    27,
+                    "3 場所表示：アルボール植物園\n27 目標欄：アルホール植物園",
+                    ""
+                )
+            ),
+            heading
+        );
+    }
+
+    #[test]
+    fn a_shared_alias_needs_context_at_the_proof_second_and_must_preserve_a_read_compound() {
+        let dictionary = Dictionary {
+            entries: [Term {
+                name: "北の案内人".into(),
+                aliases: vec!["案内人".into()],
+                context: vec!["北".into()],
+                url: "https://game.example.jp/guide".into(),
+            }]
+            .into(),
+        };
+        let heading = "南の案内人と話す";
+        let change = Evidence::new(
+            37,
+            "36 北の案内人\n37 人物の名札\n南の案内人\n38 次の人物\n北の案内人",
+            "名札に「南の案内人」とある",
+        );
+        assert_eq!(change.ocr, "人物の名札\n南の案内人");
+        assert!(dictionary.hints(heading, &change).is_empty());
+        assert_eq!(dictionary.resolve(heading, &change), heading);
+        let next_only = Evidence::new(37, "37 \n38 北の案内人", "案内人の名札が点灯");
+        assert_eq!(
+            dictionary.resolve("案内人と話す", &next_only),
+            "案内人と話す"
+        );
+
+        // The heading's longer name can be real even if it has no dictionary entry.
+        let same = frame("NPC：南の案内人　北から到着");
+        assert!(dictionary.hints(heading, &same).is_empty());
+        assert_eq!(dictionary.resolve(heading, &same), heading);
+        for name in ["古き案内人", "ミラ・案内人", "南の 案内人"] {
+            let proof = frame(&format!("名札：{name}　北から到着"));
+            assert_eq!(dictionary.resolve(name, &proof), name);
+        }
+        assert_eq!(
+            dictionary.resolve(heading, &frame("名札：南の案内人・北の案内人")),
+            heading
+        );
+
+        let identified = Evidence::new(37, "37 名札：案内人\n所属：北", "");
+        assert_eq!(dictionary.hints("案内人と話す", &identified), "北の案内人");
+        assert_eq!(
+            dictionary.resolve("案内人と話す", &identified),
+            "北の案内人と話す"
         );
     }
 
@@ -669,7 +833,7 @@ mod tests {
         let load_for = |edition, mode| {
             load(game, edition, dir.path(), mode)
                 .unwrap()
-                .resolve("暁塔で探索", "場所：暁塔")
+                .resolve("暁塔で探索", &frame("場所：暁塔"))
         };
         assert_eq!(load_for("移植版", "cache"), "夜明けの塔で探索");
         assert_eq!(load_for("原作", "cache"), "暁塔で探索");

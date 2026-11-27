@@ -476,8 +476,19 @@ impl Offer {
                 "決着",
                 "報酬",
                 "クリア",
+                "進捗",
+                "更新",
+                "進展",
+                "進行度",
+                "目標追加",
+                "目標変更",
             ],
         ) {
+            return false;
+        }
+        // Once the offer is established, a later action can advance this very
+        // quest. Only an explicit repeat of its acceptance can still be a duplicate.
+        if event.start > self.seen && !(action.contains("受注") && event.ocr.contains("受注")) {
             return false;
         }
         let is_offer = contains_any(&action, &["依頼", "受注", "クエスト", "任務", "引き受け"]);
@@ -951,6 +962,18 @@ mod tests {
         assert!(offer.matches(&event(56, 160, "地図職人の忘れ物の受注", &sheet)));
         assert!(!offer.matches(&event(57, 160, "地図職人の忘れ物を完了", &sheet)));
         assert!(!offer.matches(&event(56, 160, "地図職人の忘れ物を再開", &sheet)));
+        assert!(!offer.matches(&event(
+            165,
+            165,
+            "依頼「地図職人の忘れ物」進捗更新",
+            "古地図 1/3"
+        )));
+        assert!(!offer.matches(&event(
+            165,
+            165,
+            "依頼「地図職人の忘れ物」古地図を回収",
+            "古地図 1/3"
+        )));
         assert!(!offer.matches(&event(56, 160, "別の荷物の配達", "別の人から受け取る")));
         assert!(!offer.matches(&event(56, 160, "依頼「別の荷物」", &sheet)));
         assert!(offers(&words, &signals, 163, 171).is_empty());

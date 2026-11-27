@@ -87,6 +87,12 @@ pub struct Analyzer<'a> {
     pub ocr_command: Option<&'a Path>,
 }
 
+pub struct Scan {
+    pub events: Vec<Event>,
+    /// All requested observations finished, including optional lead-in checks.
+    pub complete: bool,
+}
+
 struct Run<'a> {
     analyzer: &'a Analyzer<'a>,
     frames: VecDeque<Frame>,
@@ -99,10 +105,11 @@ struct Run<'a> {
     // A cutscene's arrival card can appear after a conversation or in the next window.
     cutscenes: BTreeMap<u64, usize>,
     ocr_available: bool,
+    complete: bool,
 }
 
 impl Analyzer<'_> {
-    pub fn run(&self, video: &Path, step: u32) -> Result<Vec<Event>> {
+    pub fn run(&self, video: &Path, step: u32) -> Result<Scan> {
         fs::create_dir(self.dir.join("frames"))?;
         let mut run = Run {
             analyzer: self,
@@ -115,6 +122,7 @@ impl Analyzer<'_> {
             words: BTreeMap::new(),
             cutscenes: BTreeMap::new(),
             ocr_available: self.use_ocr,
+            complete: true,
         };
         crate::media::scan(video, step, |frame| {
             if run.frames.is_empty() {
@@ -148,7 +156,10 @@ impl Analyzer<'_> {
             .filter_map(|(id, event)| (!run.superseded.contains(&id)).then_some(event))
             .collect();
         events.sort_by_key(|event| event.start);
-        Ok(events)
+        Ok(Scan {
+            events,
+            complete: run.complete && (!self.use_ocr || run.ocr_available),
+        })
     }
 }
 
@@ -238,6 +249,7 @@ impl Run<'_> {
                     &self.frames,
                     &self.words,
                     self.analyzer.ocr_command,
+                    &mut self.complete,
                 )
             {
                 let proof = self
@@ -309,7 +321,7 @@ impl Run<'_> {
                 .events
                 .iter()
                 .enumerate()
-                .filter(|(id, e)| !self.superseded.contains(id) && offer.matches(e))
+                .filter(|(id, e)| *id != 0 && !self.superseded.contains(id) && offer.matches(e))
                 .map(|(id, _)| id);
             let previous = matching.next();
             self.superseded.extend(matching.collect::<Vec<_>>());
@@ -435,9 +447,11 @@ JSON {{"events":[{{"start":整数,"seen":整数,"heading":"画面内の名称や
                 .words
                 .get(&c.seen)
                 .is_some_and(|t| is_load_menu(t) || is_save_menu(t))
-                && !resumptions
-                    .iter()
-                    .any(|sec| sec.abs_diff(c.start) <= 3 && is_resume_heading(&c.heading))
+                && !resumptions.iter().any(|sec| {
+                    sec.abs_diff(c.start) <= 3
+                        && c.can_be_resumption()
+                        && is_resume_heading(&c.heading)
+                })
         });
         self.cutscene_entries(from, until)?;
         candidates.sort_by_key(|c| c.seen);
@@ -651,14 +665,10 @@ JSON {{"events":[{{"start":整数,"seen":整数,"heading":"画面内の名称や
             "作品『{}』。最後の{}秒の画像の出来事「{}」を確かめます。同じ人物・依頼・行動の導入が過去のコマに写っていれば、その再生秒。別の出来事や同じ場所での別件、単に似た画面を選ばない。特定できなければ {}。JSON {{\"start\":整数}}。",
             self.analyzer.game, proof.second, candidate.heading, initial
         );
-        let answer: Lead = match self
+        let answer: Lead = self
             .analyzer
             .model
-            .infer(&prompt, &sheet::render(&panels, 4, 400)?)
-        {
-            Err(e) if crate::model::needs_smaller_input(&e) => return Ok(initial),
-            answer => answer?,
-        };
+            .infer(&prompt, &sheet::render(&panels, 4, 400)?)?;
         Ok(panels
             .iter()
             .find(|f| f.second == answer.start)
@@ -678,7 +688,13 @@ JSON {{"events":[{{"start":整数,"seen":整数,"heading":"画面内の名称や
                 .iter()
                 .find(|f| f.second == c.start && f.second <= c.seen)
                 .map_or(c.seen, |f| f.second);
-            let lead = self.find_lead(c, index, initial)?;
+            let lead = match self.find_lead(c, index, initial) {
+                Err(error) if crate::model::needs_smaller_input(&error) => {
+                    self.complete = false;
+                    initial
+                }
+                result => result?,
+            };
             let first = self.frames.iter().position(|f| f.second == lead).unwrap();
             let mut times = Vec::new();
             // Show samples bracketing the proposed onset, plus both sides of the evidence.
@@ -790,16 +806,19 @@ proposal は仮説。根拠秒にそれが本当に起きたかを画像で検�
             } else if let Some(anchor) = self.events.iter_mut().find(|e| {
                 e.start.abs_diff(event.start) <= 2
                     && e.seen.abs_diff(event.seen) <= 3
-                    && ((e.heading == "プレイ再開" && is_resume_heading(&event.heading))
+                    && ((e.heading == "プレイ再開"
+                        && c.can_be_resumption()
+                        && is_resume_heading(&event.heading))
                         || (matches!(c.kind, Some(Kind::Place)) && e.heading == "場所紹介")
                         || (matches!(c.kind, Some(Kind::Story)) && e.heading == "会話シーン開始"))
             }) {
                 if anchor.heading != "プレイ再開" {
-                    anchor.heading = event.heading;
-                    anchor.basis = event.basis;
+                    *anchor = Event {
+                        start: anchor.start,
+                        start_image: anchor.start_image.take(),
+                        ..event
+                    };
                 }
-            } else if event.start == 0 && self.events[0].heading == "動画開始" {
-                self.events[0] = event;
             } else if !self
                 .events
                 .iter()
@@ -851,15 +870,28 @@ fn ongoing_speaker(heading: &str, seen: u64, since: u64, words: &BTreeMap<u64, S
 }
 
 fn is_resume_heading(heading: &str) -> bool {
-    [
-        "再開",
-        "プレイ開始",
-        "ゲーム開始",
-        "ロード完了",
-        "ロードして開始",
-    ]
-    .iter()
-    .any(|w| heading.contains(w))
+    matches!(
+        heading.trim(),
+        "再開"
+            | "プレイ再開"
+            | "プレイの再開"
+            | "プレイを再開"
+            | "ゲーム再開"
+            | "ゲームの再開"
+            | "ゲームを再開"
+            | "セーブデータから再開"
+            | "続きから再開"
+            | "プレイ開始"
+            | "ゲーム開始"
+            | "ロード完了"
+            | "ロードして開始"
+    )
+}
+
+impl Candidate {
+    fn can_be_resumption(&self) -> bool {
+        matches!(self.kind, None | Some(Kind::Story | Kind::Progress))
+    }
 }
 
 #[cfg(test)]

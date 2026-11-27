@@ -4,7 +4,12 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{analyze::Event, dictionary::Dictionary, media::Cue, model::Model};
+use crate::{
+    analyze::Event,
+    dictionary::{Dictionary, Evidence},
+    media::Cue,
+    model::Model,
+};
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -43,14 +48,18 @@ pub fn enrich(
         (from..until).filter(move |&i| cues[i].end > lower)
     };
     for batch in events.chunks_mut(8) {
+        let evidence: Vec<_> = batch
+            .iter()
+            .map(|e| Evidence::new(e.seen, &e.ocr, &e.basis))
+            .collect();
         let mut requests = Vec::new();
         for (id, event) in batch.iter_mut().enumerate() {
             if matches!(event.heading.as_str(), "動画開始" | "プレイ再開") {
                 continue;
             }
-            let evidence = format!("{} {}", event.ocr, event.basis);
-            let hints = dictionary.hints(&evidence);
-            event.heading = dictionary.resolve(&event.heading, &evidence);
+            let screen = &evidence[id];
+            let hints = dictionary.hints(&event.heading, screen);
+            event.heading = dictionary.resolve(&event.heading, screen);
             if event.screen_label.is_some() {
                 continue;
             }
@@ -67,8 +76,14 @@ pub fn enrich(
                 .map(|c| json!({"sec":c.start,"text":c.text.chars().take(180).collect::<String>()}))
                 .collect::<Vec<_>>();
             if !speech.is_empty() || !hints.is_empty() {
+                // When proposing dictionary spellings, show the OCR that grounds them.
+                let ocr = if hints.is_empty() {
+                    &event.ocr
+                } else {
+                    &screen.ocr
+                };
                 requests.push(
-                    json!({"id":id,"heading":event.heading,"visual":event.basis,"ocr":event.ocr,
+                    json!({"id":id,"heading":event.heading,"visual":event.basis,"ocr":ocr,
                                      "spellings":hints,"captions":speech}),
                 );
             }
@@ -96,8 +111,7 @@ pub fn enrich(
                 .collect::<Vec<_>>()
                 .join(" ");
             if crate::analyze::japanese(&heading) {
-                event.heading =
-                    dictionary.resolve(&heading, &format!("{} {}", event.ocr, event.basis));
+                event.heading = dictionary.resolve(&heading, &evidence[title.id]);
             }
         }
     }

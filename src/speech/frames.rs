@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::media::Frame;
+use crate::media::{self, Frame};
 
 /// Read only the requested whole playback seconds. Keep the keyframe before
 /// each target: an accurately input-trimmed seek could discard a picture that
@@ -22,25 +22,11 @@ pub(super) fn sample(video: &Path, mut seconds: Vec<u64>) -> Result<BTreeMap<u64
             .collect::<Vec<_>>()
             .join("+");
         let filter = format!(
-            "fps=1:round=up:eof_action=pass,trim=start={first}:end={end},select='{select}',\
-             scale=w='min(iw,1920)':h='min(ih,1920)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+            "{},trim=start={first}:end={end},select='{select}',{}",
+            media::PLAYBACK_FPS,
+            media::FRAME_SCALE
         );
-        let output = Command::new("ffmpeg")
-            .args([
-                "-nostdin",
-                "-v",
-                "error",
-                "-xerror",
-                "-protocol_whitelist",
-                "file,pipe",
-                "-copyts",
-                "-start_at_zero",
-                "-noaccurate_seek",
-                "-ss",
-                &first.to_string(),
-                "-i",
-            ])
-            .arg(video)
+        let output = media::playback_input(video, Some(first))
             .args([
                 "-map",
                 "0:V:0",
@@ -86,6 +72,7 @@ pub(super) fn sample(video: &Path, mut seconds: Vec<u64>) -> Result<BTreeMap<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn seeking_keeps_the_held_vfr_picture_and_the_container_playback_origin() -> Result<()> {
@@ -105,15 +92,98 @@ mod tests {
         let frames = sample(&video, vec![1, 2, 3, 4, 5, 30])?;
         assert_eq!(frames.keys().copied().collect::<Vec<_>>(), [2, 3, 4]);
         assert_eq!(frames[&2].jpeg, frames[&3].jpeg);
+        let mut full = Vec::new();
+        media::scan(&video, 1, |frame| {
+            assert_eq!(pixel(&frame)?, pixel(&frames[&frame.second])?);
+            full.push(frame.second);
+            Ok(())
+        })?;
+        assert_eq!(full, [2, 3, 4]);
         let sought = sample(&video, vec![3, 4])?;
-        let pixel = |second| -> Result<_> {
-            Ok(image::load_from_memory(&sought[&second].jpeg)?
-                .into_rgb8()
-                .get_pixel(16, 16)
-                .0)
-        };
-        assert!(pixel(3)?[0] > 210);
-        assert!(pixel(4)?[2] > 210);
+        assert!(pixel(&sought[&3])?[0] > 210);
+        assert!(pixel(&sought[&4])?[2] > 210);
+        Ok(())
+    }
+
+    fn pixel(frame: &Frame) -> Result<[u8; 3]> {
+        Ok(image::load_from_memory(&frame.jpeg)?
+            .into_rgb8()
+            .get_pixel(16, 16)
+            .0)
+    }
+
+    #[test]
+    fn delayed_half_second_video_does_not_backfill_zero_or_show_a_future_picture() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let video = dir.path().join("half-second.mp4");
+        // Red at 0.5, blue at 1.25 and green at 2.5 (each is held until the next PTS).
+        let status = Command::new("ffmpeg").args([
+            "-nostdin","-v","error","-f","lavfi","-i","color=c=red:s=32x32:r=4:d=1",
+            "-f","lavfi","-i","color=c=blue:s=32x32:r=4:d=1","-f","lavfi","-i","color=c=lime:s=32x32:r=4:d=1",
+            "-f","lavfi","-i","anullsrc=d=5","-filter_complex",
+            "[0:v][1:v][2:v]concat=n=3:v=1:a=0,select='eq(n,0)+eq(n,4)+eq(n,8)+eq(n,9)',setpts='if(eq(N,0),0.5,if(eq(N,1),1.25,if(eq(N,2),2.5,3.5)))/TB'[v]",
+            "-map","[v]","-map","3:a","-c:a","aac","-c:v","mpeg4","-g","1","-enc_time_base","1:4","-fps_mode","vfr",
+        ]).arg(&video).status()?;
+        ensure!(status.success(), "fractional start fixture");
+        let isolated = sample(&video, vec![0, 1, 2, 3, 4])?;
+        assert_eq!(isolated.keys().copied().collect::<Vec<_>>(), [1, 2, 3]);
+        for (step, expected) in [
+            (1, vec![(1, 0), (2, 2), (3, 1)]),
+            (2, vec![(1, 0), (3, 1)]),
+            (60, vec![(1, 0)]),
+        ] {
+            let mut pictures = Vec::new();
+            media::scan(&video, step, |frame| {
+                let rgb = pixel(&frame)?;
+                assert_eq!(rgb, pixel(&isolated[&frame.second])?);
+                let channel = rgb.iter().position(|&v| v > 210).expect("a primary color");
+                pictures.push((frame.second, channel));
+                Ok(())
+            })?;
+            assert_eq!(pictures, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_track_entirely_between_whole_seconds_yields_no_evidence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let video = dir.path().join("between-seconds.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-itsoffset",
+                "0.5",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x32:r=4:d=0.25",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=d=2",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-fps_mode",
+                "vfr",
+            ])
+            .arg(&video)
+            .status()?;
+        ensure!(status.success(), "subsecond fixture");
+        let error = media::scan(&video, 1, |_| {
+            panic!("no frame exists on the sampling grid")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("整数の再生秒"), "{error}");
+        assert!(sample(&video, vec![0, 1, 2])?.is_empty());
         Ok(())
     }
 }
