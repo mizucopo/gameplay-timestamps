@@ -1,12 +1,16 @@
 mod analyze;
 mod captions;
 mod dictionary;
+mod editor;
+mod location;
 mod media;
 mod model;
 mod observations;
 mod ocr;
+mod quest;
 mod scene;
 mod sheet;
+mod speech;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -128,6 +132,8 @@ fn generate(args: Args) -> Result<PathBuf> {
         args.step,
         args.inference_cache.as_deref(),
     )?;
+    speech::supplement(&analyzer, &video, &subtitles, &mut events)?;
+    editor::refine(&mut events, &model, &args.game);
     captions::enrich(&mut events, &subtitles, &dictionary, &model, &args.game)?;
     let mut timestamps = BufWriter::new(File::create(work.path().join("timestamps.txt"))?);
     let mut evidence = BufWriter::new(File::create(work.path().join("evidence.jsonl"))?);

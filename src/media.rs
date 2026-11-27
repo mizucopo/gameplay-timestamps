@@ -178,12 +178,9 @@ pub fn cues(video: &Path, use_audio: bool, transcriber: Option<&Path>) -> Vec<Cu
         .map(|text| parse_cues(&text))
         .find(|cues| !cues.is_empty())
         .unwrap_or_default();
-    let Ok(info) = probe(video, false) else {
-        return cues;
-    };
+    let streams = probe(video, false).map(|p| p.streams).unwrap_or_default();
     if cues.is_empty() {
-        let mut tracks: Vec<_> = info
-            .streams
+        let mut tracks: Vec<_> = streams
             .iter()
             .filter(|s| s.codec_type == "subtitle")
             .collect();
@@ -208,7 +205,7 @@ pub fn cues(video: &Path, use_audio: bool, transcriber: Option<&Path>) -> Vec<Cu
     }
     if let Some(program) = transcriber
         && use_audio
-        && info.streams.iter().any(|s| s.codec_type == "audio")
+        && streams.iter().any(|s| s.codec_type == "audio")
     {
         match timed_output(Command::new(program).arg(video)) {
             Ok(speech) => cues.extend(speech),
@@ -283,7 +280,50 @@ fn cue_block(lines: &[&str]) -> Option<Cue> {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&");
-    (start < end && !text.is_empty()).then_some(Cue { start, end, text })
+    (start < end && has_speech(&text)).then_some(Cue { start, end, text })
+}
+
+// A caption consisting entirely of sound descriptions, timing marks or music
+// symbols cannot nominate or name a dialogue event. Retain speaker tags on
+// lines that also have spoken words.
+fn has_speech(text: &str) -> bool {
+    let mut close = None;
+    let mut letters = String::new();
+    for ch in text.chars() {
+        if let Some(end) = close {
+            if ch == end {
+                close = None;
+            }
+            continue;
+        }
+        close = match ch {
+            '[' => Some(']'),
+            '［' => Some('］'),
+            '【' => Some('】'),
+            '(' => Some(')'),
+            '（' => Some('）'),
+            _ => None,
+        };
+        if ch.is_alphabetic() && !matches!(ch, 'ー' | 'ｰ' | '々' | 'ゝ' | 'ゞ' | 'ヽ' | 'ヾ')
+        {
+            letters.extend(ch.to_lowercase());
+        }
+    }
+    !matches!(
+        letters.as_str(),
+        "" | "music"
+            | "musicplaying"
+            | "backgroundmusic"
+            | "bgm"
+            | "sfx"
+            | "silence"
+            | "applause"
+            | "laughter"
+            | "音楽"
+            | "拍手"
+            | "効果音"
+            | "無音"
+    )
 }
 
 fn subtitle_time(value: &str) -> Option<f64> {
@@ -291,8 +331,12 @@ fn subtitle_time(value: &str) -> Option<f64> {
     let sec: f64 = fields.next()?.replace(',', ".").parse().ok()?;
     let min: u32 = fields.next()?.parse().ok()?;
     let hours: u64 = fields.next().unwrap_or("0").parse().ok()?;
-    (fields.next().is_none() && min < 60 && (0.0..60.0).contains(&sec))
-        .then_some(hours as f64 * 3600.0 + f64::from(min) * 60.0 + sec)
+    let time = hours as f64 * 3600.0 + f64::from(min) * 60.0 + sec;
+    (fields.next().is_none()
+        && min < 60
+        && (0.0..60.0).contains(&sec)
+        && time < (i64::MAX / 1_000_000 - 10) as f64)
+        .then_some(time)
 }
 
 #[cfg(test)]
@@ -309,6 +353,28 @@ mod tests {
                 end: 9612.2,
                 text: "ここは どこ？".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn sound_annotations_and_punctuation_cannot_trigger_speech_inference() {
+        let cues = [
+            "……！？",
+            "♪ ～ ー ♪",
+            "[door slams]",
+            "（歓声）【拍手】",
+            "♪ Music ♪",
+            "【村人】「橋を渡って」",
+            "[Speaker] The gate is open.",
+        ];
+        let srt = cues
+            .into_iter()
+            .map(|line| format!("00:01.000 --> 00:03.000\n{line}\n\n"))
+            .collect::<String>();
+        let spoken: Vec<_> = parse_cues(&srt).into_iter().map(|cue| cue.text).collect();
+        assert_eq!(
+            spoken,
+            ["【村人】「橋を渡って」", "[Speaker] The gate is open."]
         );
     }
 

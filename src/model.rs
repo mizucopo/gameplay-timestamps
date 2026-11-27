@@ -13,6 +13,20 @@ use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+#[derive(Debug)]
+struct Truncated;
+impl std::fmt::Display for Truncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("モデルの出力上限に達しました")
+    }
+}
+impl std::error::Error for Truncated {}
+pub fn needs_smaller_input(e: &anyhow::Error) -> bool {
+    e.is::<Truncated>()
+        || e.downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+}
+
 pub struct Model {
     client: Client,
     endpoint: Url,
@@ -39,7 +53,7 @@ impl Model {
             .no_proxy()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(240))
+            .timeout(Duration::from_secs(600))
             .build()?;
         let token = std::env::var("GAMEPLAY_VLM_API_KEY").ok();
         let name = match model {
@@ -123,6 +137,9 @@ impl Model {
                 );
             }
             let value: Value = response.json().context("推論 API の応答を読めません")?;
+            if value["choices"][0]["finish_reason"] == "length" {
+                return Err(Truncated.into());
+            }
             let content = value["choices"][0]["message"]["content"]
                 .as_str()
                 .context("推論結果に本文がありません")?;

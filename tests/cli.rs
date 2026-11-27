@@ -40,15 +40,20 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
             reader.read_exact(&mut body)?;
             let body: Value = serde_json::from_slice(&body)?;
             let prompt = body["messages"][1]["content"][0]["text"].as_str().unwrap();
-            let candidate = |s, h: &str, update: Option<usize>| json!({"start":s,"seen":s,"heading":h,"basis":h,"update":update});
+            let candidate = |s, h: &str, update: Option<usize>| json!({"start":s,"seen":s,"heading":h,"update":update});
             let answer = if prompt.contains("新規対象 0〜299") {
-                json!({"events":[candidate(9,"再開",None), candidate(13,"港の紹介",None),candidate(196,"依頼の導入",None)]})
+                json!({"events":[json!({"start":9,"seen":13,"heading":"再開"}), candidate(13,"港の紹介",Some(1)),candidate(196,"依頼の導入",None)]})
             } else if prompt.contains("新規対象 300〜") {
                 json!({"events":[candidate(308,"依頼名の表示",Some(3))]})
             } else if prompt.contains("個々の台詞") {
-                let rows = [(9,"プレイ再開"),(13,"港の紹介"),(196,"依頼の導入"),(308,"時計職人の依頼")]
-                    .into_iter().filter(|(s,_)|prompt.contains(&format!("\"seen\":{s},")))
-                    .map(|(s,h)|json!({"seen":s,"start":s,"heading":h,"basis":"画面の文字を前後で照合"})).collect::<Vec<_>>();
+                let inputs: Vec<Value> = serde_json::from_str(prompt.lines().last().unwrap())?;
+                let rows=inputs.iter().map(|input| {
+                    let seen=input["seen"].as_u64().unwrap();
+                    let (start,heading)=match seen {9=>(9,"プレイ再開"),13 if input["id"] == 0 => (9,"プレイ再開"),
+                         13=>(13,"港の紹介"),196=>(196,"依頼の導入"),
+                        308=>(308,"時計職人の依頼"), _=>panic!("unexpected proof")};
+                    json!({"id":input["id"],"start":start,"heading":heading,"basis":"画面の文字を前後で照合"})
+                }).collect::<Vec<_>>();
                 json!({"events":rows})
             } else {
                 anyhow::bail!("unexpected request: {prompt}");

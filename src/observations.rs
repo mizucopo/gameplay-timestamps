@@ -24,6 +24,8 @@ pub fn read_or_scan(
     for src in [
         include_str!("analyze.rs"),
         include_str!("ocr.rs"),
+        include_str!("quest.rs"),
+        include_str!("location.rs"),
         include_str!("model.rs"),
         include_str!("sheet.rs"),
         include_str!("scene.rs"),
@@ -69,7 +71,7 @@ pub fn read_or_scan(
     fs::create_dir(a.dir.join("frames"))?;
     let images = events
         .iter()
-        .flat_map(|e| [&e.start_image, &e.evidence_image])
+        .flat_map(|e| e.start_image.iter().chain([&e.evidence_image]))
         .collect::<BTreeSet<_>>();
     for path in images {
         // Only numeric frame names produced by the observation pass may be materialized.

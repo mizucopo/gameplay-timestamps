@@ -12,11 +12,19 @@ cargo build --locked --release
 vllm serve Qwen/Qwen3-VL-4B-Instruct --host 127.0.0.1 --port 8000
 ```
 
+macOS での実録画評価には llama.cpp と Qwen3-VL-8B-Instruct の GGUF を使いました。画像入力用プロジェクターも同じモデルのものを指定します。
+
+```sh
+llama-server -m /path/to/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
+  --mmproj /path/to/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf \
+  --host 127.0.0.1 --port 8000 -c 16384
+```
+
 ```sh
 ./target/release/gameplay-timestamps "ゲームタイトル" "/path/to/Part5.mp4"
 ```
 
-実行後に表示される `Part5.timestamps/timestamps.txt` を開いてください。先頭は `0:00`、1時間以降は `1:00:00` の形式です。`evidence.jsonl` の各行は同じ順の見出しに対応します。`start` と `start_image` は導入、`seen` と `evidence_image` は判定の根拠です。たとえば会話の途中で依頼名が出た場合、両者の時刻は別になります。出力がすでにある場合は `-o 別のディレクトリ` を指定してください。
+実行後に表示される `Part5.timestamps/timestamps.txt` を開いてください。先頭は `0:00`、1時間以降は `1:00:00` の形式です。`evidence.jsonl` の各行は同じ順の見出しに対応します。`start` と `start_image` は導入、`seen` と `evidence_image` は判定の根拠です。たとえば会話の途中で依頼名が出た場合、両者の時刻は別になります。映像トラックが遅れて始まる録画では、先頭行の `start_image` は `null`、`evidence_image` は最初に表示されたフレームです。出力がすでにある場合は `-o 別のディレクトリ` を指定してください。
 
 | 用途 | 指定 |
 | --- | --- |
@@ -27,6 +35,8 @@ vllm serve Qwen/Qwen3-VL-4B-Instruct --host 127.0.0.1 --port 8000
 | 別の日本語 OCR を使う | `--ocr-command /path/to/command`。JPEG を標準入力、読み取った UTF-8 テキストを標準出力とする |
 | 長い録画の再試行や条件比較 | `--inference-cache /path/to/private-cache`。同一入力の推論応答と完了済みの映像観察を再利用する。モデルの重みや OCR 環境を差し替えたら新しいディレクトリを使う |
 
-映像走査の既定間隔は1秒です。代表画像を時間順にまとめ、固定画面の会話、目標表示、短い画面変化も調べます。依頼やボスの名称が遅れて出たときは前の映像をたどり、前後の拡大画像で見出しを確認します。字幕は同名の `.ja.srt` / `.ja.vtt`、`.srt` / `.vtt`、または内蔵のテキスト字幕から自動で読みます。音声なし、無音、文字起こし失敗時も同じコマンドで処理できます。
+映像走査の既定間隔は1秒です。代表画像を時間順にまとめ、固定画面の会話、目標表示、短い画面変化も調べます。依頼やボスの名称が遅れて出たときは前の映像をたどり、前後の拡大画像で見出しを確認します。字幕は同名の `.ja.srt` / `.ja.vtt`、`.srt` / `.vtt`、または内蔵のテキスト字幕から自動で読みます。字幕や文字起こしに物語の節目を示す台詞があると、その前後の元映像を確認し、出来事や会話の導入が画面に写っていれば見出しを追加したり開始時刻を早めたりします。音声なし、無音、文字起こし失敗時も同じコマンドで処理できます。
 
-映像と中間画像の処理にはループバック上のモデルを使います。外部の辞書検索に使う情報は作品名・版・照会語です。[作品別辞書と OCR](docs/dictionary.md)・[実録画の採点方法](docs/evaluation.md)・[vLLM の画像入力](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
+複数の画面で地名表示や依頼票の名称を確かめた場合、`evidence.jsonl` の `screen_label` に読み取った表記を保存します。
+
+映像と中間画像の処理にはループバック上のモデルを使います。外部の辞書検索に使う情報は作品名・版・照会語です。[作品別辞書と OCR](docs/dictionary.md)・[実録画の採点方法](docs/evaluation.md)・[実録画による評価](docs/evaluation-results.md)・[vLLM の画像入力](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
