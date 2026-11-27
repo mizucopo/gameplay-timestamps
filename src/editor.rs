@@ -52,7 +52,7 @@ fn protected(e: &Event) -> bool {
     e.start == 0 || e.screen_label.is_some() || resumes_play(e)
 }
 
-fn conversation(e: &Event) -> bool {
+pub(crate) fn conversation(e: &Event) -> bool {
     has(
         &e.basis,
         &[
@@ -183,6 +183,7 @@ fn battle_heading(heading: &str) -> bool {
             "決戦",
             "対決",
             "勝利",
+            "敗北",
             "撃破",
             "討伐",
             "決着",
@@ -236,11 +237,6 @@ fn action_on_screen(e: &Event) -> bool {
                 "敵が倒れ",
                 "敵が出現",
                 "敵が現れ",
-                "勝利画面",
-                "リザルト",
-                "勝利表示",
-                "勝利の表示",
-                "撃破表示",
                 "攻撃が命中",
                 "武器を振り",
                 "敵の姿が映",
@@ -249,13 +245,7 @@ fn action_on_screen(e: &Event) -> bool {
                 "敵が消滅",
             ],
         )
-    }) || e.ocr.lines().any(|line| {
-        matches!(
-            line.trim()
-                .trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace()),
-            "VICTORY" | "WIN" | "YOU WIN" | "戦闘結果" | "戦闘勝利" | "討伐成功"
-        )
-    })
+    }) || crate::battle::result_at_proof(e)
 }
 
 fn routine_ui(e: &Event) -> bool {

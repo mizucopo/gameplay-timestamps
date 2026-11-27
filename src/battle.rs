@@ -134,39 +134,149 @@ fn battle_start(heading: &str) -> Option<&str> {
     })
 }
 
-fn reset(text: &str) -> bool {
-    [
-        "ゲームオーバー",
-        "全滅",
-        "再挑戦",
-        "再戦",
-        "戦闘終了",
-        "戦闘結果",
-        "戦闘勝利",
-        "討伐成功",
-        "リザルト",
-    ]
-    .iter()
-    .any(|s| text.contains(s))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndScreen {
+    Result,
+    Retry,
+}
+
+fn reward_summary(text: &str) -> bool {
+    // A score line or labelled item reward corroborates the result banner.
+    // Speech about gaining experience lacks this label-and-value layout.
+    static REWARD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?ix)^(?:
+          (?: (?:獲得|入手)?(?:経験値|ゴールド|賞金|報酬金|金額) |
+              (?:EXP|XP|EXPERIENCE(?:POINTS)?|GOLD)(?:GAINED|EARNED)? )
+          [:：]?[+＋]?[0-9０-９][0-9０-９,，]*(?:G|円|ポイント)?
+        | (?:戦闘報酬|獲得報酬|報酬|獲得アイテム|入手アイテム|REWARDS?|ITEMSRECEIVED)
+          [:：][\p{L}\p{N}・ー+＋×,，]{1,48}
+        )$",
+        )
+        .unwrap()
+    });
+    text.lines().any(|line| REWARD.is_match(&compact(line)))
+}
+
+// Compare a whole OCR line, not a word embedded in an objective or a quote.
+// Empty space also occurs between glyphs on a stylized result banner.
+fn end_screen(text: &str, spoken: bool) -> Option<EndScreen> {
+    if selection_screen(text)
+        || text.contains("会話ログ")
+        || text.lines().any(|line| {
+            matches!(
+                line.trim().to_ascii_uppercase().as_str(),
+                "DIALOGUE" | "DIALOGUE LOG"
+            )
+        })
+    {
+        return None;
+    }
+    let dialogue_controls = spoken
+        || text.contains("スキップ")
+        || text.contains("オート")
+        || text
+            .lines()
+            .any(|line| matches!(line.trim().to_ascii_uppercase().as_str(), "SKIP" | "AUTO"));
+    let mut retry = None;
+    for line in text.lines() {
+        let label = compact(line);
+        let label = label.trim_end_matches(['!', '！']).to_ascii_uppercase();
+        match label.as_str() {
+            "勝利"
+            | "敗北"
+            | "戦闘勝利"
+            | "戦闘敗北"
+            | "戦闘終了"
+            | "戦闘結果"
+            | "討伐成功"
+            | "全滅"
+            | "ゲームオーバー"
+            | "リザルト"
+            | "VICTORY"
+            | "WIN"
+            | "YOUWIN"
+            | "YOUWON"
+            | "BATTLEWON"
+            | "DEFEAT"
+            | "LOSE"
+            | "YOULOSE"
+            | "YOULOST"
+            | "BATTLELOST"
+            | "GAMEOVER"
+            | "YOUDIED"
+            | "BATTLERESULT"
+            | "BATTLERESULTS" => {
+                return (!dialogue_controls || reward_summary(text)).then_some(EndScreen::Result);
+            }
+            "再戦" | "再挑戦" | "リトライ" | "RETRY" | "TRYAGAIN" | "REMATCH" => {
+                retry = Some(EndScreen::Retry)
+            }
+            _ => {}
+        }
+    }
+    if dialogue_controls { None } else { retry }
+}
+
+fn described_result(e: &Event) -> bool {
+    static SHOWN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+        r"(?:勝利|敗北|撃破|全滅|ゲームオーバー|戦闘結果|リザルト)(?:」|』)?(?:の?(?:表示|画面))?(?:が(?:表示され|現れ|出現|出た|映)|へ?切り替わ|に切り替わ|と表示され|を表示した)"
+    ).unwrap()
+    });
+    e.basis.split(['、', '。', '\n']).any(|part| {
+        SHOWN.is_match(part)
+            && ![
+                "ない",
+                "なかった",
+                "未確認",
+                "と話",
+                "と語",
+                "と言",
+                "言及",
+                "だろう",
+                "はず",
+                "について",
+            ]
+            .iter()
+            .any(|v| part.contains(v))
+    })
+}
+
+fn spoken_result(e: &Event) -> bool {
+    crate::editor::conversation(e) && !described_result(e)
+}
+
+pub(crate) fn result_at_proof(e: &Event) -> bool {
+    if described_result(e) {
+        return true;
+    }
+    let proof = crate::dictionary::Evidence::new(e.seen, &e.ocr, "");
+    end_screen(&proof.ocr, crate::editor::conversation(e)) == Some(EndScreen::Result)
 }
 
 fn result_event(e: &Event) -> bool {
-    reset(&e.heading)
-        || [
-            "形態変化",
-            "形態移行",
-            "に変身",
-            "を撃破",
-            "に勝利",
-            "戦に敗北",
-            "との決着",
-            "プレイ再開",
-        ]
+    if ["形態変化", "形態移行", "に変身", "プレイ再開"]
         .iter()
         .any(|s| e.heading.contains(s))
+    {
+        return true;
+    }
+    let result_heading = end_screen(&e.heading, false).is_some()
+        || [
+            "を撃破",
+            "に勝利",
+            "に敗北",
+            "との決着",
+            "に再挑戦",
+            "と再戦",
+        ]
+        .iter()
+        .any(|s| e.heading.ends_with(s));
+    result_heading && !spoken_result(e)
 }
 
-fn selection_or_dialogue(text: &str) -> bool {
+fn selection_screen(text: &str) -> bool {
     [
         "図鑑",
         "スロット",
@@ -178,6 +288,10 @@ fn selection_or_dialogue(text: &str) -> bool {
     .iter()
     .any(|s| text.contains(s))
         || (text.contains("閉じる") && (text.contains("武器") || text.contains("装備")))
+}
+
+fn selection_or_dialogue(text: &str) -> bool {
+    selection_screen(text)
         || ((text.contains("スキップ") || text.contains("オート")) && !text.contains("を倒"))
 }
 
@@ -269,7 +383,7 @@ fn observations(
         }
     };
     for (&time, text) in words {
-        if reset(text) {
+        if boundaries.contains(&time) && end_screen(text, false).is_some() {
             finish(&mut times, &mut groups);
             continue;
         }
@@ -336,9 +450,15 @@ impl Tracker {
             events,
             from,
         } = window;
+        let Some(first_frame) = frames.front() else {
+            return Ok(());
+        };
+        let events = events
+            .iter()
+            .filter(|e| e.seen >= first_frame.second)
+            .collect::<Vec<_>>();
         let mut names = events
             .iter()
-            .filter(|e| frames.front().is_some_and(|f| e.seen >= f.second))
             .filter_map(|e| generic_attack(&e.heading).or_else(|| battle_start(&e.heading)))
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
@@ -376,11 +496,20 @@ impl Tracker {
                 }
             }
         }
-        let boundaries = events
+        let spoken: BTreeSet<_> = events
             .iter()
-            .filter(|e| result_event(e))
-            .map(|e| e.start)
+            .filter(|e| spoken_result(e))
+            .map(|e| e.seen)
             .collect();
+        let boundaries: BTreeSet<_> =
+            events
+                .iter()
+                .filter(|e| result_event(e))
+                .map(|e| e.seen)
+                .chain(words.iter().filter_map(|(&sec, text)| {
+                    end_screen(text, spoken.contains(&sec)).map(|_| sec)
+                }))
+                .collect();
         let mut meters = BTreeMap::new();
         for name in names {
             for samples in observations(&name, words, &boundaries) {
@@ -426,9 +555,15 @@ impl Tracker {
                 // The last dark-to-field transition before the nameplate can
                 // already introduce the encounter. Do not backtrack through
                 // an intervening dialogue or menu into its earlier scene.
+                let lower = boundaries
+                    .range(..a.second)
+                    .next_back()
+                    .copied()
+                    .unwrap_or(0)
+                    .max(a.second.saturating_sub(10));
                 let history = frames
                     .iter()
-                    .filter(|f| f.second >= a.second.saturating_sub(10) && f.second <= a.second)
+                    .filter(|f| f.second >= lower && f.second <= a.second)
                     .collect::<Vec<_>>();
                 let mut at = a;
                 for pair in history.windows(2).rev() {
@@ -475,7 +610,7 @@ impl Tracker {
                         basis:format!("{second}秒から戦闘場面に切り替わり、{}秒と{}秒の敵名・体力ゲージを照合",a.second,b.second),
                         start_image:Some(save(dir,get(second).expect("selected battle frame"))?),
                         evidence_image:save(dir,a)?,screen_label:Some(name.clone()),
-                        ocr:format!("{} {name}\n{} {name}",a.second,b.second),
+                        ocr:crate::analyze::event_ocr(words,second,b.second,a.second,&name),
                     });
                 }
                 self.intervals.push(Encounter {
@@ -797,5 +932,120 @@ mod tests {
             [10, 15, 17, 19, 21, 24]
         );
         assert!(events.iter().all(|e| battle_start(&e.heading).is_none()));
+    }
+
+    #[test]
+    fn only_standalone_results_end_a_fight_and_only_its_proof_protects_a_heading() {
+        for label in [
+            "戦闘勝利",
+            "敗北",
+            "全滅",
+            "VICTORY",
+            "You win!",
+            "DEFEAT",
+            "game over",
+        ] {
+            assert_eq!(
+                end_screen(&format!("{label}\nEXP +100"), false),
+                Some(EndScreen::Result)
+            );
+        }
+        for speech in [
+            "次こそ戦闘勝利を目指そう",
+            "再戦の約束",
+            "「敗北」",
+            "SKIP\nVICTORY",
+            "You win if you reach the top.",
+        ] {
+            assert!(end_screen(speech, false).is_none(), "{speech}");
+        }
+        let mut claim = event(12, "魔竜に勝利", "船長との会話で魔竜に勝利したと話す");
+        claim.ocr = "11 VICTORY\n12 次は勝てるかな".into();
+        assert!(!result_at_proof(&claim) && !result_event(&claim));
+        claim.ocr = "11 これから向かう\n12 YOU WIN".into();
+        assert!(!result_at_proof(&claim) && !result_event(&claim));
+        claim.basis = "会話が終わり、勝利画面が現れた".into();
+        assert!(result_at_proof(&claim) && result_event(&claim));
+    }
+
+    #[test]
+    fn skip_is_a_control_on_reward_cards_as_well_as_in_dialogue() {
+        for card in [
+            "VICTORY\n獲得経験値：120\nスキップ",
+            "You Win!\nExperience gained: +48\nSKIP",
+            "勝利\n報酬：銅の鍵\nスキップ",
+        ] {
+            assert_eq!(end_screen(card, true), Some(EndScreen::Result), "{card}");
+        }
+        for speech in [
+            "会話ログ\n隊長：勝利はまだ先だ。\nスキップ",
+            "会話ログ\nVICTORY\n獲得経験値：120\nスキップ",
+            "DIALOGUE LOG\nVICTORY\nRewards: Key\nSKIP",
+            "VICTORY\n経験値を獲得できると話す\nスキップ",
+            "獲得経験値：120\nスキップ",
+        ] {
+            assert!(end_screen(speech, false).is_none(), "{speech}");
+        }
+    }
+
+    #[test]
+    fn a_result_breaks_the_encounter_and_the_next_intro_cannot_reach_past_it() {
+        let (frames, signals) = footage(true);
+        for result in ["Victory!", "戦闘敗北", "VICTORY\n獲得経験値：120\nスキップ"] {
+            let mut words = (9..=24)
+                .map(|t| {
+                    let text = if t == 15 {
+                        result.into()
+                    } else {
+                        let form = if t < 15 { "白銀" } else { "琥珀" };
+                        format!("{OPPONENT}\n称号：{form}")
+                    };
+                    (t, text)
+                })
+                .collect::<BTreeMap<_, _>>();
+            words.insert(12, "VICTORY".into());
+            let mut events = [10, 11, 17, 18]
+                .into_iter()
+                .map(|t| attack(t, OPPONENT, "敵が攻撃を開始した。"))
+                .collect::<Vec<_>>();
+            events.push(event(
+                12,
+                "勝利への決意",
+                "隊長との会話で勝利について語る。",
+            ));
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("frames")).unwrap();
+            let mut tracker = Tracker::default();
+            let mut calls = 0;
+            tracker
+                .inspect(
+                    Window {
+                        frames: &frames,
+                        words: &words,
+                        signals: &signals,
+                        events: &events,
+                        from: 0,
+                    },
+                    dir.path(),
+                    |_, _| {
+                        calls += 1;
+                        Ok(Phase::Intro)
+                    },
+                )
+                .unwrap();
+            assert_eq!(calls, 2);
+            tracker.consolidate(&mut events);
+            assert_eq!(
+                events.iter().map(|e| e.start).collect::<Vec<_>>(),
+                [7, 10, 12, 16, 17]
+            );
+            for (e, form) in [(&events[0], "白銀"), (&events[3], "琥珀")] {
+                assert!(e.ocr.contains(&format!("称号：{form}")));
+                let proof = crate::dictionary::Evidence::new(e.seen, &e.ocr, "");
+                assert!(proof.ocr.contains(&format!("称号：{form}")));
+                let confirm = crate::dictionary::Evidence::new(e.seen + 1, &e.ocr, "");
+                assert!(confirm.ocr.contains(&format!("称号：{form}")));
+            }
+        }
     }
 }

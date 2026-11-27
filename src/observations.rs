@@ -16,14 +16,15 @@ pub fn read_or_scan(
     video: &Path,
     step: u32,
     cache: Option<&Path>,
-) -> Result<Vec<Event>> {
+) -> Result<Scan> {
     let Some(cache) = cache else {
-        return Ok(a.run(video, step)?.events);
+        return a.run(video, step);
     };
     let mut hash = Sha256::new();
     for src in [
         include_str!("analyze.rs"),
         include_str!("battle.rs"),
+        include_str!("editor.rs"),
         include_str!("ocr.rs"),
         include_str!("quest.rs"),
         include_str!("location.rs"),
@@ -41,7 +42,7 @@ pub fn read_or_scan(
     let adapter = match a.ocr_command {
         Some(path) => match file_hash(path) {
             Ok(hash) if path.components().count() > 1 => Some(hash),
-            _ => return Ok(a.run(video, step)?.events),
+            _ => return a.run(video, step),
         },
         None => None,
     };
@@ -67,9 +68,13 @@ pub fn read_or_scan(
     finish(tmp.path(), &dir, a.dir, scan)
 }
 
-fn finish(work: &Path, cache: &Path, output: &Path, scan: Scan) -> Result<Vec<Event>> {
+fn finish(work: &Path, cache: &Path, output: &Path, scan: Scan) -> Result<Scan> {
     if scan.complete {
         fs::write(work.join("events.json"), serde_json::to_vec(&scan.events)?)?;
+        fs::write(
+            work.join("map-cursor-seconds.json"),
+            serde_json::to_vec(&scan.cursor_seconds)?,
+        )?;
         if let Err(error) = fs::rename(work, cache)
             && !cache.is_dir()
         {
@@ -77,21 +82,32 @@ fn finish(work: &Path, cache: &Path, output: &Path, scan: Scan) -> Result<Vec<Ev
         }
     } else if !cache.is_dir() {
         // Return this invocation's evidence without publishing a degraded scan.
-        return materialize(work, output, scan.events);
+        return materialize(work, output, scan);
     }
     // A concurrent successful scan may have already published its complete evidence.
     load(cache, output)
 }
 
-fn load(cache: &Path, output: &Path) -> Result<Vec<Event>> {
+fn load(cache: &Path, output: &Path) -> Result<Scan> {
     let events: Vec<Event> = serde_json::from_reader(fs::File::open(cache.join("events.json"))?)?;
     ensure!(!events.is_empty(), "映像観察キャッシュに記録がありません");
-    materialize(cache, output, events)
+    let cursor_seconds =
+        serde_json::from_reader(fs::File::open(cache.join("map-cursor-seconds.json"))?)?;
+    materialize(
+        cache,
+        output,
+        Scan {
+            events,
+            cursor_seconds,
+            complete: true,
+        },
+    )
 }
 
-fn materialize(source: &Path, output: &Path, events: Vec<Event>) -> Result<Vec<Event>> {
+fn materialize(source: &Path, output: &Path, scan: Scan) -> Result<Scan> {
     fs::create_dir(output.join("frames"))?;
-    let images = events
+    let images = scan
+        .events
         .iter()
         .flat_map(|e| e.start_image.iter().chain([&e.evidence_image]))
         .collect::<BTreeSet<_>>();
@@ -108,7 +124,7 @@ fn materialize(source: &Path, output: &Path, events: Vec<Event>) -> Result<Vec<E
         let (src, dst) = (source.join(path), output.join(path));
         fs::copy(src, dst)?;
     }
-    Ok(events)
+    Ok(scan)
 }
 
 #[cfg(test)]
@@ -142,14 +158,16 @@ mod tests {
                 output.path(),
                 Scan {
                     events: vec![event],
+                    cursor_seconds: [42].into(),
                     complete,
                 },
             )?;
             assert_eq!(
                 fs::read_to_string(output.path().join(frame))?,
-                returned[0].heading
+                returned.events[0].heading
             );
-            Ok(returned.into_iter().next().unwrap().heading)
+            assert_eq!(returned.cursor_seconds, [42].into());
+            Ok(returned.events.into_iter().next().unwrap().heading)
         };
         assert_eq!(scan(false, "映像のみ")?, "映像のみ");
         assert!(!cache.exists());

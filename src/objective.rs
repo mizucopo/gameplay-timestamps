@@ -1,5 +1,6 @@
 //! A tracked HUD objective can change while the scenery and the active quest
 //! remain the same. Read the panel independently of the model's scene choices.
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -15,9 +16,33 @@ use crate::{analyze::Event, media::Frame};
 struct Goal {
     title: String,
     action: String,
+    slot: Option<&'static str>,
+}
+
+#[derive(Ord, PartialOrd, Eq, PartialEq)]
+enum Topic {
+    Quest(String),
+    Active(&'static str),
+    Independent(String),
 }
 
 impl Goal {
+    fn topic(&self) -> Topic {
+        if !self.title.is_empty() {
+            Topic::Quest(self.title.clone())
+        } else if let Some(slot) = self.slot {
+            Topic::Active(slot)
+        } else {
+            Topic::Independent(self.action.clone())
+        }
+    }
+
+    fn replaced_by(&self, next: &Goal) -> bool {
+        self.action != next.action
+            && ((!self.title.is_empty() && self.title == next.title)
+                || (self.slot.is_some() && self.slot == next.slot))
+    }
+
     fn heading(&self) -> String {
         if self.title.is_empty() {
             format!("目標「{}」", self.action)
@@ -27,11 +52,12 @@ impl Goal {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct Reading {
     titles: BTreeSet<String>,
     actions: BTreeSet<String>,
     explicit: bool,
+    slots: BTreeSet<&'static str>,
 }
 
 static ACTION: LazyLock<Regex> = LazyLock::new(|| {
@@ -44,21 +70,22 @@ static ACTION: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn interface(text: &str) -> bool {
-    [
-        "セーブスロット",
-        "ロードスロット",
-        "クエスト一覧",
-        "ワールドマップ",
-        "ファストトラベル",
-        "目的地を選択",
-        "装備変更",
-        "会話ログ",
-        "自動送り",
-        "スキップ",
-        "オート再生",
-    ]
-    .iter()
-    .any(|flag| text.contains(flag))
+    crate::map::cursor_control(text)
+        || [
+            "セーブスロット",
+            "ロードスロット",
+            "クエスト一覧",
+            "ワールドマップ",
+            "ファストトラベル",
+            "目的地を選択",
+            "装備変更",
+            "会話ログ",
+            "自動送り",
+            "スキップ",
+            "オート再生",
+        ]
+        .iter()
+        .any(|flag| text.contains(flag))
 }
 
 fn icon_tail(text: &str) -> bool {
@@ -84,16 +111,22 @@ fn read_lines(text: &str) -> Reading {
             "現在の目標",
             "次の目標",
             "探索目標",
+            "サブ目標",
+            "副目標",
             "目標",
             "目的地",
             "任務",
             "クエスト",
         ] {
             if let Some(rest) = line.strip_prefix(marker) {
-                if rest.is_empty() {
-                    read.explicit = true;
-                } else if let Some(rest) = rest.strip_prefix(['：', ':']) {
-                    read.explicit = true;
+                if !rest.is_empty() && !rest.starts_with(['：', ':']) {
+                    break;
+                }
+                read.explicit = true;
+                if matches!(marker, "現在の目標" | "次の目標" | "目的地") {
+                    read.slots.insert(marker);
+                }
+                if let Some(rest) = rest.strip_prefix(['：', ':']) {
                     value = rest;
                     marker_name = Some(marker);
                 }
@@ -150,6 +183,11 @@ impl Reading {
         Some(Goal {
             title: self.titles.first().cloned().unwrap_or_default(),
             action: self.actions.first()?.clone(),
+            slot: if self.titles.is_empty() && self.slots.len() == 1 {
+                self.slots.first().copied()
+            } else {
+                None
+            },
         })
     }
 
@@ -157,6 +195,7 @@ impl Reading {
         self.titles.extend(other.titles);
         self.actions.extend(other.actions);
         self.explicit |= other.explicit;
+        self.slots.extend(other.slots);
     }
 }
 
@@ -217,7 +256,11 @@ fn panel_read(frame: &Frame, panel: Panel, command: Option<&Path>) -> Result<Rea
         };
         let mut jpeg = Vec::new();
         JpegEncoder::new_with_quality(&mut jpeg, 92).encode_image(&crop)?;
-        read.add(read_lines(&crate::ocr::read(&jpeg, command)?));
+        let text = crate::ocr::read(&jpeg, command)?;
+        if interface(&text) || crate::quest::is_offer_screen(&text) {
+            return Ok(Reading::default());
+        }
+        read.add(read_lines(&text));
         if read.goal().is_some() {
             break;
         }
@@ -228,10 +271,26 @@ fn panel_read(frame: &Frame, panel: Panel, command: Option<&Path>) -> Result<Rea
 #[derive(Default)]
 pub struct Tracker {
     events: Vec<Event>,
-    current: BTreeMap<String, (u64, String)>,
+    current: BTreeMap<Topic, (u64, String)>,
     preferred: Option<Panel>,
     next_sweep: u64,
     unavailable: bool,
+}
+
+struct ScreenText<'a> {
+    words: &'a BTreeMap<u64, String>,
+    is_cursor: &'a dyn Fn(u64) -> bool,
+    read_full: &'a dyn Fn(&Frame) -> Result<String>,
+}
+
+impl ScreenText<'_> {
+    fn excluded(&self, second: u64) -> bool {
+        (self.is_cursor)(second)
+            || self
+                .words
+                .get(&second)
+                .is_some_and(|text| interface(text) || crate::quest::is_offer_screen(text))
+    }
 }
 
 impl Tracker {
@@ -240,20 +299,30 @@ impl Tracker {
         from: u64,
         frames: &VecDeque<Frame>,
         words: &BTreeMap<u64, String>,
-        command: Option<&Path>,
-        dir: &Path,
+        maps: &crate::map::Tracker,
+        analyzer: &crate::analyze::Analyzer<'_>,
         complete: &mut bool,
     ) -> Result<()> {
-        self.observe_with(from, frames, words, dir, complete, |frame, panel| {
-            panel_read(frame, panel, command)
-        })
+        let screen = ScreenText {
+            words,
+            is_cursor: &|second| maps.is_cursor(second),
+            read_full: &|frame| crate::ocr::read(&frame.jpeg, analyzer.ocr_command),
+        };
+        self.observe_with(
+            from,
+            frames,
+            screen,
+            analyzer.dir,
+            complete,
+            |frame, panel| panel_read(frame, panel, analyzer.ocr_command),
+        )
     }
 
     fn observe_with(
         &mut self,
         from: u64,
         frames: &VecDeque<Frame>,
-        words: &BTreeMap<u64, String>,
+        screen: ScreenText<'_>,
         dir: &Path,
         complete: &mut bool,
         mut recognize: impl FnMut(&Frame, Panel) -> Result<Reading>,
@@ -285,30 +354,40 @@ impl Tracker {
             .enumerate()
             .filter(|(_, f)| f.second >= from.saturating_sub(8))
         {
-            let text = words.get(&frame.second).map(String::as_str).unwrap_or("");
-            if interface(text) || crate::quest::is_offer_screen(text) {
+            let text = screen
+                .words
+                .get(&frame.second)
+                .map(String::as_str)
+                .unwrap_or("");
+            if screen.excluded(frame.second) {
                 continue;
             }
             let clue = read_lines(text);
             if clue.explicit
                 && let Some(goal) = clue.goal()
-                && let Some((&second, _)) = words
-                    .range(frame.second.saturating_add(1)..=frame.second.saturating_add(8))
-                    .find(|(_, t)| {
-                        let other = read_lines(t);
-                        other.explicit
-                            && other.goal().as_ref() == Some(&goal)
-                            && !crate::quest::is_offer_screen(t)
+                && let Some((second, _)) = (frame.second.saturating_add(1)
+                    ..=frame.second.saturating_add(8))
+                    .take_while(|&second| !screen.excluded(second))
+                    .filter_map(|second| {
+                        let other = read_lines(screen.words.get(&second)?);
+                        let observed = other.goal()?;
+                        other.explicit.then_some((second, observed))
                     })
+                    .take_while(|(_, next)| !goal.replaced_by(next))
+                    .find(|(_, next)| *next == goal)
             {
                 seen.entry((frame.second, goal))
                     .or_insert((frame.second, second));
             }
             let periodic = frame.second >= self.next_sweep;
-            if !periodic && (!clue.useful() || last_clue.is_some_and(|t| frame.second - t <= 2)) {
+            if !periodic
+                && (!clue.useful()
+                    || last_clue
+                        .as_ref()
+                        .is_some_and(|(t, previous)| frame.second - t <= 2 && previous == &clue))
+            {
                 continue;
             }
-            last_clue = Some(frame.second);
             if periodic {
                 self.next_sweep = frame.second.saturating_add(20);
             }
@@ -316,6 +395,7 @@ impl Tracker {
             let panels = preferred
                 .into_iter()
                 .chain(PANELS.into_iter().filter(|p| Some(*p) != preferred));
+            let mut corroborated = false;
             for panel in panels {
                 let Some(seed) = inspect(index, panel) else {
                     break;
@@ -323,7 +403,8 @@ impl Tracker {
                 if !seed.useful() {
                     continue;
                 }
-                let mut matched: BTreeMap<Goal, Vec<usize>> = BTreeMap::new();
+                let mut previous = BTreeMap::<Goal, usize>::new();
+                let mut matched = Vec::new();
                 for (near, f) in frames
                     .iter()
                     .enumerate()
@@ -331,34 +412,27 @@ impl Tracker {
                     .skip(index.saturating_sub(3))
                 {
                     let second = f.second;
-                    if second.abs_diff(frame.second) > 8
-                        || words
-                            .get(&second)
-                            .is_some_and(|s| interface(s) || crate::quest::is_offer_screen(s))
-                    {
+                    if second.abs_diff(frame.second) > 8 || screen.excluded(second) {
+                        previous.clear();
                         continue;
                     }
                     let Some(read) = inspect(near, panel) else {
                         break;
                     };
                     if let Some(goal) = read.goal() {
-                        matched.entry(goal).or_default().push(near);
+                        previous.retain(|prior, _| !prior.replaced_by(&goal));
+                        if let Some(first) = previous.insert(goal.clone(), near) {
+                            matched.push((goal, first, near));
+                        }
                     }
                 }
                 let mut confirmed = false;
-                for (goal, indices) in matched {
-                    let [first, proof, ..] = indices.as_slice() else {
-                        continue;
-                    };
+                for (goal, first, proof) in matched {
                     // Work back through this display when small type was first
                     // noticed at a periodic probe. Do not bridge a changed or hidden HUD.
-                    let mut start = frames[*first].second;
-                    for (i, old) in frames.iter().enumerate().take(*first).rev() {
-                        if frames[*first].second - old.second > 20
-                            || words
-                                .get(&old.second)
-                                .is_some_and(|s| interface(s) || crate::quest::is_offer_screen(s))
-                        {
+                    let mut start = frames[first].second;
+                    for (i, old) in frames.iter().enumerate().take(first).rev() {
+                        if frames[first].second - old.second > 20 || screen.excluded(old.second) {
                             break;
                         }
                         let Some(read) = inspect(i, panel) else {
@@ -374,14 +448,20 @@ impl Tracker {
                     }
                     confirmed |= clue.actions.is_empty() || clue.actions.contains(&goal.action);
                     seen.entry((start, goal))
-                        .or_insert((frames[*first].second, frames[*proof].second));
+                        .or_insert((frames[first].second, frames[proof].second));
                 }
                 if confirmed {
+                    corroborated = true;
                     self.preferred = Some(panel);
                     if !periodic {
                         break;
                     }
                 }
+            }
+            // An unsuccessful sweep at a menu exit must not suppress the
+            // first actionable clue on the very next frame.
+            if corroborated && clue.useful() {
+                last_clue = Some((frame.second, clue));
             }
             if failed.get() {
                 break;
@@ -391,24 +471,65 @@ impl Tracker {
             *complete = false;
             self.unavailable = true;
         }
-        for ((start, goal), (first_seen, proof)) in seen {
-            let key = if goal.title.is_empty() {
-                &goal.action
-            } else {
-                &goal.title
-            };
+        // Some small text was detectable only in a crop. Complete the source
+        // context of accepted goals without changing the base model's inputs.
+        let mut originals = Cow::Borrowed(screen.words);
+        for ((mut start, goal), (first_seen, proof)) in seen {
+            let key = goal.topic();
             if self
                 .current
-                .get(key)
+                .get(&key)
                 .is_some_and(|(previous, action)| start <= *previous || action == &goal.action)
             {
                 continue;
             }
-            self.current
-                .insert(key.clone(), (start, goal.action.clone()));
+            for second in crate::analyze::evidence_seconds(start, first_seen, proof) {
+                if !self.unavailable
+                    && !originals.contains_key(&second)
+                    && let Some(frame) = frames.iter().find(|f| f.second == second)
+                {
+                    match (screen.read_full)(frame) {
+                        Ok(text) => {
+                            originals.to_mut().insert(second, text);
+                        }
+                        Err(error) => {
+                            eprintln!("目標の元画面 OCR を利用できません ({error})");
+                            *complete = false;
+                            self.unavailable = true;
+                        }
+                    }
+                }
+            }
+            let menu = |second| {
+                originals
+                    .get(&second)
+                    .is_some_and(|text| interface(text) || crate::quest::is_offer_screen(text))
+            };
+            if menu(first_seen) || menu(proof) {
+                continue;
+            }
+            if menu(start) {
+                start = first_seen;
+            }
+            let weak_copy = matches!(key, Topic::Independent(_))
+                && self.current.iter().any(|(topic, (_, action))| {
+                    matches!(topic, Topic::Active(_)) && action == &goal.action
+                });
+            self.current.insert(key, (start, goal.action.clone()));
+            let label = goal.heading();
+            // The full image and the narrower crop can show the same action
+            // with or without its active-slot label. Keep both pieces of state
+            // while publishing their overlapping proof only once.
+            if weak_copy
+                || self
+                    .events
+                    .iter()
+                    .any(|e| e.heading == label && e.start <= proof && start <= e.seen)
+            {
+                continue;
+            }
             let first = frames.iter().find(|f| f.second == start).unwrap();
             let last = frames.iter().find(|f| f.second == proof).unwrap();
-            let label = goal.heading();
             self.events.push(Event {
                 start,
                 seen: proof,
@@ -416,9 +537,8 @@ impl Tracker {
                 basis: format!("{first_seen} 秒と {proof} 秒の目標欄に「{label}」を確認。開始は画面で追える最初の {start} 秒"),
                 start_image: Some(crate::analyze::save(dir, first)?),
                 evidence_image: crate::analyze::save(dir, last)?,
-                ocr: format!(
-                    "{first_seen} {} {}\n{proof} {} {}",
-                    goal.title, goal.action, goal.title, goal.action
+                ocr: crate::analyze::event_ocr(
+                    &originals, start, first_seen, proof, format!("{} {}",goal.title,goal.action).trim(),
                 ),
                 screen_label: Some(label),
             });
@@ -448,6 +568,14 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screens(words: &BTreeMap<u64, String>) -> ScreenText<'_> {
+        ScreenText {
+            words,
+            is_cursor: &|_| false,
+            read_full: &|_| Ok(String::new()),
+        }
+    }
 
     #[test]
     fn separates_a_destination_from_its_changing_action_and_ignores_dialogue_and_controls() {
@@ -490,7 +618,7 @@ mod tests {
         tracker.observe_with(
             0,
             &frames,
-            &words,
+            screens(&words),
             root.path(),
             &mut complete,
             |frame, panel| {
@@ -548,14 +676,185 @@ mod tests {
         ]);
         let mut tracker = Tracker::default();
         let mut complete = true;
-        tracker.observe_with(300, &frames, &words, dir.path(), &mut complete, |_, _| {
-            Ok(Reading::default())
-        })?;
+        tracker.observe_with(
+            300,
+            &frames,
+            screens(&words),
+            dir.path(),
+            &mut complete,
+            |_, _| Ok(Reading::default()),
+        )?;
         assert!(complete);
         assert_eq!(tracker.events.len(), 1);
         assert_eq!(
             (tracker.events[0].start, tracker.events[0].seen),
             (299, 300)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_an_active_objective_can_restore_it_while_side_goals_stay_independent() -> Result<()>
+    {
+        let frames: VecDeque<_> = (0..24)
+            .map(|second| Frame {
+                second,
+                jpeg: vec![second as u8],
+            })
+            .collect();
+        let words = BTreeMap::from([
+            (2, "現在の目標：北門へ向かう".into()),
+            (3, "現在の目標：北門へ向かう".into()),
+            (4, "副目標：銀貨を集める".into()),
+            (5, "副目標：銀貨を集める".into()),
+            (8, "現在の目標：南門へ向かう".into()),
+            (9, "現在の目標：南門へ向かう".into()),
+            (11, "副目標：古い鐘を探す".into()),
+            (12, "副目標：古い鐘を探す".into()),
+            (15, "現在の目標：北門へ向かう".into()),
+            (16, "現在の目標：北門へ向かう\n地区：白波".into()),
+            (17, "隣の画面の名前".into()),
+            (19, "副目標：銀貨を集める".into()),
+            (20, "副目標：銀貨を集める".into()),
+        ]);
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("frames"))?;
+        let mut tracker = Tracker::default();
+        tracker.observe_with(
+            0,
+            &frames,
+            screens(&words),
+            dir.path(),
+            &mut true,
+            |frame, panel| {
+                // A tighter crop can lose "現在の" while showing the same
+                // physical label that the full frame identifies as active.
+                if panel == PANELS[0]
+                    && let Some(line) = words.get(&frame.second)
+                    && line.starts_with("現在の目標")
+                {
+                    Ok(read_lines(line.trim_start_matches("現在の")))
+                } else {
+                    Ok(Reading::default())
+                }
+            },
+        )?;
+        assert_eq!(
+            tracker.events.iter().map(|e| e.start).collect::<Vec<_>>(),
+            [2, 4, 8, 11, 15]
+        );
+        let restored = tracker.events.last().unwrap();
+        assert_eq!(restored.seen, 16);
+        let proof = crate::dictionary::Evidence::new(restored.seen, &restored.ocr, &restored.basis);
+        assert!(proof.ocr.contains("地区：白波"));
+        assert!(!proof.ocr.contains("隣の画面の名前"));
+        assert!(restored.ocr.contains("17 隣の画面の名前"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_blind_sweep_on_return_to_play_does_not_consume_the_next_actionable_clue() -> Result<()> {
+        let frames: VecDeque<_> = (0..20)
+            .map(|second| Frame {
+                second,
+                jpeg: vec![1],
+            })
+            .collect();
+        let words = BTreeMap::from([(12, "現在地：霞の広場".into()), (13, "扉を開ける".into())]);
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("frames"))?;
+        let screen = ScreenText {
+            words: &words,
+            is_cursor: &|s| s < 12,
+            read_full: &|_| Ok(String::new()),
+        };
+        let mut tracker = Tracker::default();
+        tracker.observe_with(0, &frames, screen, dir.path(), &mut true, |f, p| {
+            let text = if p == PANELS[0] {
+                match f.second {
+                    12 | 13 => "扉を開ける",
+                    14 | 16 => "霧の庭へ\n扉を開ける",
+                    _ => "",
+                }
+            } else {
+                ""
+            };
+            Ok(read_lines(text))
+        })?;
+        assert_eq!(tracker.events.len(), 1);
+        assert_eq!((tracker.events[0].start, tracker.events[0].seen), (12, 16));
+        Ok(())
+    }
+
+    #[test]
+    fn crop_only_objective_keeps_full_proof_context_at_the_original_second() -> Result<()> {
+        let frames: VecDeque<_> = (0..5)
+            .map(|second| Frame {
+                second,
+                jpeg: vec![1],
+            })
+            .collect();
+        let words = BTreeMap::new();
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("frames"))?;
+        let screen = ScreenText {
+            words: &words,
+            is_cursor: &|_| false,
+            read_full: &|frame| Ok(format!("地区：{}区", frame.second)),
+        };
+        let mut tracker = Tracker::default();
+        tracker.observe_with(0, &frames, screen, dir.path(), &mut true, |f, p| {
+            Ok(if p == PANELS[0] && f.second <= 2 {
+                read_lines("目的地：雪の港")
+            } else {
+                Reading::default()
+            })
+        })?;
+        assert_eq!(tracker.events.len(), 1);
+        let goal = &tracker.events[0];
+        let proof = crate::dictionary::Evidence::new(goal.seen, &goal.ocr, &goal.basis);
+        assert!(proof.ocr.contains(&format!("地区：{}区", goal.seen)));
+        assert!(proof.ocr.contains("雪の港へ"));
+        assert!(!proof.ocr.contains("地区：2区"));
+        assert!(goal.ocr.contains("2 地区：2区"));
+        Ok(())
+    }
+
+    #[test]
+    fn map_selection_cannot_supply_an_objective_even_when_a_tight_crop_shows_only_the_place()
+    -> Result<()> {
+        let frames: VecDeque<_> = (0..6)
+            .map(|second| Frame {
+                second,
+                jpeg: vec![1],
+            })
+            .collect();
+        let words = BTreeMap::from([
+            (0, "地図を閉じる\n目的地：白波の港".into()),
+            (1, "カーソルリセット\n目的地：白波の港".into()),
+            (2, "目的地：白波の港".into()),
+            (3, "目的地：白波の港".into()),
+            (4, "現在の目標：鐘を探す".into()),
+            (5, "現在の目標：鐘を探す".into()),
+        ]);
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("frames"))?;
+        let mut tracker = Tracker::default();
+        let screen = ScreenText {
+            words: &words,
+            is_cursor: &|sec| (2..=3).contains(&sec),
+            read_full: &|_| Ok(String::new()),
+        };
+        tracker.observe_with(0, &frames, screen, dir.path(), &mut true, |frame, _| {
+            assert!(frame.second >= 4);
+            Ok(Reading::default())
+        })?;
+        assert_eq!(tracker.events.len(), 1);
+        assert_eq!(tracker.events[0].heading, "目標「鐘を探す」");
+        assert!(
+            read_lines("目的地：白波の港\nマップを閉じる")
+                .goal()
+                .is_none()
         );
         Ok(())
     }
@@ -574,7 +873,7 @@ mod tests {
         tracker.observe_with(
             0,
             &frames,
-            &BTreeMap::new(),
+            screens(&BTreeMap::new()),
             dir.path(),
             &mut complete,
             |_, _| anyhow::bail!("OCR unavailable"),
@@ -583,7 +882,7 @@ mod tests {
         tracker.observe_with(
             0,
             &frames,
-            &BTreeMap::new(),
+            screens(&BTreeMap::new()),
             dir.path(),
             &mut complete,
             |_, _| panic!("failed adapter used again"),

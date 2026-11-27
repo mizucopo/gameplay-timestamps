@@ -2,14 +2,18 @@
 //! second, image-based observation can add an event or move its introduction.
 mod frames;
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    analyze::{Analyzer, Event, japanese},
+    analyze::{Analyzer, Event, Scan, japanese},
     media::{Cue, Frame},
     sheet,
 };
@@ -55,17 +59,12 @@ struct Confirmation {
     existing: Option<usize>,
 }
 
-pub fn supplement(
-    a: &Analyzer<'_>,
-    video: &Path,
-    cues: &[Cue],
-    events: &mut Vec<Event>,
-) -> Result<()> {
+pub fn supplement(a: &Analyzer<'_>, video: &Path, cues: &[Cue], scan: &mut Scan) -> Result<()> {
     inspect(
         a,
         video,
         cues,
-        events,
+        scan,
         |text| a.model.infer(text, &[]),
         |text, image| a.model.infer(text, image),
     )
@@ -75,7 +74,7 @@ fn inspect(
     a: &Analyzer<'_>,
     video: &Path,
     cues: &[Cue],
-    events: &mut Vec<Event>,
+    scan: &mut Scan,
     mut propose: impl FnMut(&str) -> Result<Proposals>,
     mut confirm: impl FnMut(&str, &[u8]) -> Result<Confirmations>,
 ) -> Result<()> {
@@ -129,12 +128,12 @@ fn inspect(
             }
         }
         for group in intervals.into_iter().collect::<Vec<_>>().chunks(2) {
-            verify(a, video, group, events, &mut confirm)?;
+            verify(a, video, group, scan, &mut confirm)?;
         }
         cursor = end;
         limit = (limit + 1).min(64);
     }
-    events.sort_by_key(|event| event.start);
+    scan.events.sort_by_key(|event| event.start);
     Ok(())
 }
 
@@ -144,13 +143,48 @@ struct View {
     known: Vec<usize>,
 }
 
+const MAP_LOOKBACK: u64 = 12;
+
+fn fill_pictures(
+    video: &Path,
+    pictures: &mut BTreeMap<u64, Frame>,
+    seconds: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    let missing: Vec<_> = seconds
+        .into_iter()
+        .filter(|sec| !pictures.contains_key(sec))
+        .collect();
+    if !missing.is_empty() {
+        pictures.extend(frames::sample(video, missing)?);
+    }
+    Ok(())
+}
+
+fn arrival_start(start: u64, seen: u64, playing: impl Fn(u64) -> bool) -> Option<u64> {
+    if !playing(seen) {
+        return None;
+    }
+    if start == seen || playing(start) {
+        return Some(start);
+    }
+    let mut onset = seen;
+    for sec in (start.max(seen.saturating_sub(MAP_LOOKBACK))..seen).rev() {
+        if !playing(sec) {
+            break;
+        }
+        onset = sec;
+    }
+    Some(onset)
+}
+
 fn verify(
     a: &Analyzer<'_>,
     video: &Path,
     intervals: &[Moment],
-    events: &mut Vec<Event>,
+    scan: &mut Scan,
     confirm: &mut impl FnMut(&str, &[u8]) -> Result<Confirmations>,
 ) -> Result<()> {
+    let events = &mut scan.events;
     let mut seconds = Vec::new();
     let mut views = Vec::new();
     for &Moment {
@@ -186,7 +220,7 @@ fn verify(
             known,
         });
     }
-    let pictures = frames::sample(video, seconds)?;
+    let mut pictures = frames::sample(video, seconds)?;
     let mut rows = Vec::new();
     for (id, view) in views.iter_mut().enumerate() {
         view.starts.retain(|s| pictures.contains_key(s));
@@ -218,12 +252,14 @@ fn verify(
     let checked = match confirm(&prompt, &sheet::render(&panels, 3, 448)?) {
         Err(error) if intervals.len() > 1 && crate::model::needs_smaller_input(&error) => {
             for single in intervals.chunks(1) {
-                verify(a, video, single, events, confirm)?;
+                verify(a, video, single, scan, confirm)?;
             }
             return Ok(());
         }
         response => response?,
     };
+    let mut words = BTreeMap::new();
+    let mut use_ocr = a.use_ocr;
     for c in checked.events.into_iter().take(4) {
         let Some(view) = views.get(c.id) else {
             continue;
@@ -239,32 +275,78 @@ fn verify(
         {
             continue;
         }
+        // A subtitle can nominate a new scene independently. A destination
+        // selected on a map cannot substantiate arrival, including on cache hits.
+        let existing_travel = c
+            .existing
+            .filter(|id| view.known.contains(id))
+            .is_some_and(|id| crate::map::movement_destination(&events[id].heading).is_some());
+        let travel = existing_travel || crate::map::movement_destination(&heading).is_some();
+        let mut start = c.start;
+        if travel {
+            let last_picker = scan
+                .cursor_seconds
+                .range(start..=c.seen)
+                .next_back()
+                .copied();
+            start = last_picker.unwrap_or(start);
+            let from = start.max(c.seen.saturating_sub(MAP_LOOKBACK));
+            fill_pictures(video, &mut pictures, from..=c.seen)?;
+            let playing = |second: u64| -> bool {
+                if scan.cursor_seconds.contains(&second) {
+                    return false;
+                }
+                let Some(frame) = pictures.get(&second) else {
+                    return false;
+                };
+                match crate::map::playable_picture(a, frame) {
+                    Ok(playing) => playing,
+                    Err(error) => {
+                        eprintln!("{second} 秒の地図と移動を照合できません ({error})");
+                        false
+                    }
+                }
+            };
+            let Some(onset) = arrival_start(start, c.seen, playing) else {
+                continue;
+            };
+            start = onset;
+        }
         if let Some(id) = c.existing {
             if view.known.contains(&id)
-                && c.start < events[id].start
+                && start < events[id].start
                 && events[id].screen_label.is_none()
             {
                 let existing = &mut events[id];
-                existing.start_image = Some(save(a.dir, &pictures[&c.start])?);
-                existing.start = c.start;
+                existing.start_image = Some(save(a.dir, &pictures[&start])?);
+                existing.start = start;
             }
             continue;
         }
         if events
             .iter()
-            .any(|e| e.heading == heading && (e.seen == c.seen || e.start == c.start))
+            .any(|e| e.heading == heading && (e.seen == c.seen || e.start == start))
         {
             continue;
         }
+        if use_ocr {
+            let seconds = crate::analyze::evidence_seconds(start, c.seen, c.seen);
+            fill_pictures(video, &mut pictures, seconds.iter().copied())?;
+            for sec in seconds {
+                if let Some(frame) = pictures.get(&sec) {
+                    crate::analyze::read_screen(&mut words, &mut use_ocr, frame, a.ocr_command);
+                }
+            }
+        }
         let event = Event {
-            start: c.start,
+            start,
             seen: c.seen,
             heading,
             basis,
-            start_image: Some(save(a.dir, &pictures[&c.start])?),
+            start_image: Some(save(a.dir, &pictures[&start])?),
             evidence_image: save(a.dir, &pictures[&c.seen])?,
             screen_label: None,
-            ocr: String::new(),
+            ocr: crate::analyze::event_ocr(&words, start, c.seen, c.seen, ""),
         };
         events.push(event);
     }
@@ -287,8 +369,17 @@ mod tests {
     use anyhow::ensure;
     use std::process::Command;
 
-    fn base() -> Vec<Event> {
-        [("動画開始", 0, 0), ("門を開く依頼", 8, 9)]
+    #[test]
+    fn a_map_selection_is_neither_proof_nor_an_earlier_start_for_a_spoken_arrival() {
+        let screens = |t| (4..=6).contains(&t);
+        assert_eq!(arrival_start(2, 3, screens), None);
+        assert_eq!(arrival_start(2, 6, screens), Some(4));
+        assert_eq!(arrival_start(5, 6, screens), Some(5));
+        assert_eq!(arrival_start(7, 8, screens), None);
+    }
+
+    fn base() -> Scan {
+        let events = [("動画開始", 0, 0), ("門を開く依頼", 8, 9)]
             .map(|(heading, start, seen)| Event {
                 heading: heading.into(),
                 start,
@@ -299,7 +390,12 @@ mod tests {
                 evidence_image: format!("frames/{seen:08}.jpg"),
                 screen_label: None,
             })
-            .into()
+            .into();
+        Scan {
+            events,
+            cursor_seconds: BTreeSet::new(),
+            complete: true,
+        }
     }
 
     #[test]
@@ -374,8 +470,8 @@ mod tests {
             |_| panic!("no timed language"),
             |_, _| panic!("no candidate"),
         )?;
-        assert_eq!(silent.len(), 2);
-        assert_eq!(silent[1].start, 8);
+        assert_eq!(silent.events.len(), 2);
+        assert_eq!(silent.events[1].start, 8);
         assert_eq!(fs::read_dir(tmp.path().join("frames"))?.count(), 0);
 
         let cues: Vec<_> = [
@@ -456,6 +552,7 @@ mod tests {
             })
         })?;
         assert_eq!(visually_checked, 2);
+        let events = events.events;
         let headings: Vec<_> = events
             .iter()
             .map(|e| (e.start, e.seen, e.heading.as_str()))

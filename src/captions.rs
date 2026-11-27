@@ -25,6 +25,13 @@ struct Title {
     heading: String,
 }
 
+fn preserves_travel(original: &str, proposed: &str) -> bool {
+    // Renaming may clarify the destination. Opening a map or discussing a
+    // place does not become an actual arrival when a subtitle names it.
+    crate::map::movement_destination(proposed).is_none()
+        || crate::map::movement_destination(original).is_some()
+}
+
 pub fn enrich(
     events: &mut [Event],
     cues: &[Cue],
@@ -110,10 +117,30 @@ pub fn enrich(
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            if crate::analyze::japanese(&heading) {
+            if crate::analyze::japanese(&heading) && preserves_travel(&event.heading, &heading) {
                 event.heading = dictionary.resolve(&heading, &evidence[title.id]);
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captions_can_name_a_journey_without_turning_a_map_or_a_conversation_into_one() {
+        for title in [
+            "雪の港に到着",
+            "雪の港への到着",
+            "雪の港に着いた",
+            "雪の港への移動",
+        ] {
+            assert!(!preserves_travel("港の地図を開く", title));
+            assert!(!preserves_travel("船員と行き先を話す", title));
+            assert!(preserves_travel("次の港へ移動", title));
+        }
+        assert!(preserves_travel("港の地図を開く", "雪の港の地図を開く"));
+    }
 }

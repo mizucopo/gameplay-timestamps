@@ -129,13 +129,14 @@ fn generate(args: Args) -> Result<PathBuf> {
         use_ocr: !args.no_ocr,
         ocr_command: args.ocr_command.as_deref(),
     };
-    let mut events = observations::read_or_scan(
+    let mut scan = observations::read_or_scan(
         &analyzer,
         &video,
         args.step,
         args.inference_cache.as_deref(),
     )?;
-    speech::supplement(&analyzer, &video, &subtitles, &mut events)?;
+    speech::supplement(&analyzer, &video, &subtitles, &mut scan)?;
+    let mut events = scan.events;
     editor::refine(&mut events, &model, &args.game);
     captions::enrich(&mut events, &subtitles, &dictionary, &model, &args.game)?;
     // Keep the source opening until every later proof has had a chance to move

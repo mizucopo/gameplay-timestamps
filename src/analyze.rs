@@ -89,6 +89,8 @@ pub struct Analyzer<'a> {
 
 pub struct Scan {
     pub events: Vec<Event>,
+    /// Original frames independently identified as a destination picker.
+    pub cursor_seconds: BTreeSet<u64>,
     /// All requested observations finished, including optional lead-in checks.
     pub complete: bool,
 }
@@ -161,11 +163,13 @@ impl Analyzer<'_> {
             .enumerate()
             .filter_map(|(id, event)| (!run.superseded.contains(&id)).then_some(event))
             .collect();
+        let cursor_seconds = run.maps.cursor_seconds();
         run.maps.merge(&mut events);
         run.objectives.merge(&mut events);
         run.battles.consolidate(&mut events);
         Ok(Scan {
             events,
+            cursor_seconds,
             complete: run.complete && (!self.use_ocr || run.ocr_available),
         })
     }
@@ -180,6 +184,41 @@ pub(crate) fn save(dir: &Path, frame: &Frame) -> Result<String> {
     Ok(relative)
 }
 
+pub(crate) fn evidence_seconds(start: u64, first: u64, seen: u64) -> BTreeSet<u64> {
+    BTreeSet::from([
+        start,
+        first,
+        seen.saturating_sub(1),
+        seen,
+        seen.saturating_add(1),
+    ])
+}
+
+/// Preserve the complete OCR at its own playback second. Only the two
+/// corroborating frames receive the independently verified local reading.
+pub(crate) fn event_ocr(
+    words: &BTreeMap<u64, String>,
+    start: u64,
+    first: u64,
+    seen: u64,
+    local: &str,
+) -> String {
+    let mut lines = Vec::new();
+    for second in evidence_seconds(start, first, seen) {
+        let screen = words.get(&second).map(String::as_str).unwrap_or("");
+        for line in screen.lines().filter(|line| !line.trim().is_empty()) {
+            lines.push(format!("{second} {line}"));
+        }
+        if (second == first || second == seen)
+            && !local.is_empty()
+            && !screen.lines().any(|line| line == local)
+        {
+            lines.push(format!("{second} {local}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn clean(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -190,7 +229,7 @@ pub fn japanese(value: &str) -> bool {
         .any(|c| matches!(c, 'ぁ'..='ヿ' | '㐀'..='鿿'))
 }
 
-fn read_screen(
+pub(crate) fn read_screen(
     words: &mut BTreeMap<u64, String>,
     available: &mut bool,
     frame: &Frame,
@@ -247,8 +286,8 @@ impl Run<'_> {
                 from,
                 &self.frames,
                 &self.words,
-                self.analyzer.ocr_command,
-                self.analyzer.dir,
+                &self.maps,
+                self.analyzer,
                 &mut self.complete,
             )?;
         }
