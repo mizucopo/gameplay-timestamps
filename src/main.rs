@@ -1,10 +1,14 @@
 mod analyze;
+mod battle;
 mod captions;
+mod description;
 mod dictionary;
 mod editor;
 mod location;
+mod map;
 mod media;
 mod model;
+mod objective;
 mod observations;
 mod ocr;
 mod quest;
@@ -12,8 +16,7 @@ mod scene;
 mod sheet;
 mod speech;
 
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -144,16 +147,7 @@ fn generate(args: Args) -> Result<PathBuf> {
     {
         events.retain(|e| !(e.start == 0 && e.heading == "動画開始" && e.basis == "録画の先頭"));
     }
-    let mut timestamps = BufWriter::new(File::create(work.path().join("timestamps.txt"))?);
-    let mut evidence = BufWriter::new(File::create(work.path().join("evidence.jsonl"))?);
-    for event in &events {
-        writeln!(timestamps, "{} {}", clock(event.start), event.heading)?;
-        serde_json::to_writer(&mut evidence, event)?;
-        writeln!(evidence)?;
-    }
-    timestamps.flush()?;
-    evidence.flush()?;
-    drop((timestamps, evidence));
+    description::write(work.path(), events)?;
     fs::rename(work.path(), &output).context("結果の出力先を確定できません")?;
     Ok(output)
 }

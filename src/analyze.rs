@@ -104,6 +104,9 @@ struct Run<'a> {
     words: BTreeMap<u64, String>,
     // A cutscene's arrival card can appear after a conversation or in the next window.
     cutscenes: BTreeMap<u64, usize>,
+    maps: crate::map::Tracker,
+    objectives: crate::objective::Tracker,
+    battles: crate::battle::Tracker,
     ocr_available: bool,
     complete: bool,
 }
@@ -121,6 +124,9 @@ impl Analyzer<'_> {
             signals: BTreeMap::new(),
             words: BTreeMap::new(),
             cutscenes: BTreeMap::new(),
+            maps: crate::map::Tracker::default(),
+            objectives: crate::objective::Tracker::default(),
+            battles: crate::battle::Tracker::default(),
             ocr_available: self.use_ocr,
             complete: true,
         };
@@ -155,7 +161,9 @@ impl Analyzer<'_> {
             .enumerate()
             .filter_map(|(id, event)| (!run.superseded.contains(&id)).then_some(event))
             .collect();
-        events.sort_by_key(|event| event.start);
+        run.maps.merge(&mut events);
+        run.objectives.merge(&mut events);
+        run.battles.consolidate(&mut events);
         Ok(Scan {
             events,
             complete: run.complete && (!self.use_ocr || run.ocr_available),
@@ -163,7 +171,7 @@ impl Analyzer<'_> {
     }
 }
 
-fn save(dir: &Path, frame: &Frame) -> Result<String> {
+pub(crate) fn save(dir: &Path, frame: &Frame) -> Result<String> {
     let relative = format!("frames/{:08}.jpg", frame.second);
     let path = dir.join(&relative);
     if !path.exists() {
@@ -213,6 +221,37 @@ impl Run<'_> {
         self.inspect_range(first, self.frames.len())?;
         self.confirm_offers(from, until)?;
         self.identify_locations(until)?;
+        if self.ocr_available
+            && let Err(error) =
+                self.maps
+                    .observe(from, &self.frames, &self.words, &self.events, self.analyzer)
+        {
+            self.complete = false;
+            eprintln!("地図の地点選択と移動を照合できません。既存の観察を保持します ({error})");
+        }
+        if self.ocr_available
+            && let Err(error) = self.battles.observe(
+                &self.frames,
+                &self.words,
+                &self.signals,
+                &self.events,
+                from,
+                self.analyzer,
+            )
+        {
+            self.complete = false;
+            eprintln!("ボス戦の開始を照合できません。既存の観察を保持します ({error})");
+        }
+        if self.ocr_available {
+            self.objectives.observe(
+                from,
+                &self.frames,
+                &self.words,
+                self.analyzer.ocr_command,
+                self.analyzer.dir,
+                &mut self.complete,
+            )?;
+        }
         if from / 300 != (until + 1) / 300 || from == 0 {
             eprintln!("走査済み {until} 秒 / 見出し {} 件", self.events.len());
         }

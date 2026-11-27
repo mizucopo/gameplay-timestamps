@@ -9,7 +9,7 @@ Rust、FFmpeg（`ffmpeg` と `ffprobe`）、同じ PC で動く画像入力対�
 ```sh
 cargo build --locked --release
 # vLLM を使う場合は別のターミナルで起動
-vllm serve Qwen/Qwen3-VL-4B-Instruct --host 127.0.0.1 --port 8000
+vllm serve Qwen/Qwen3-VL-8B-Instruct --host 127.0.0.1 --port 8000
 ```
 
 macOS での実録画評価には llama.cpp と Qwen3-VL-8B-Instruct の GGUF を使いました。画像入力用プロジェクターも同じモデルのものを指定します。
@@ -25,6 +25,8 @@ llama-server -m /path/to/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
 ```
 
 実行後に表示される `Part5.timestamps/timestamps.txt` を開いてください。先頭は `0:00`、1時間以降は `1:00:00` の形式です。`evidence.jsonl` の各行は同じ順の見出しに対応します。`start` と `start_image` は導入、`seen` と `evidence_image` は判定の根拠です。たとえば会話の途中で依頼名が出た場合、両者の時刻は別になります。映像トラックが遅れて始まる録画では、先頭行の `start_image` は `null`、`evidence_image` は最初に表示されたフレームです。出力がすでにある場合は `-o 別のディレクトリ` を指定してください。
+
+タイムスタンプだけを貼ったときに日本語の動画説明欄へ収まるよう、改行を含めて半角換算5,000文字までにします。超える場合は録画の先頭と最後、プレイ再開とその直後の場面紹介、依頼や戦闘などの節目を優先し、同じ優先度では録画全体に分散させます。予約文字の `<` と `>` は貼り付け用には全角にします。行を選んだり表記を調整した場合、元の全行と根拠を `timestamps-full.txt` と `evidence-full.jsonl` に保存します。[YouTube ヘルプの日本語の文字数制限](https://support.google.com/youtube/answer/12948449?hl=ja)
 
 | 用途 | 指定 |
 | --- | --- |

@@ -23,9 +23,12 @@ pub fn read_or_scan(
     let mut hash = Sha256::new();
     for src in [
         include_str!("analyze.rs"),
+        include_str!("battle.rs"),
         include_str!("ocr.rs"),
         include_str!("quest.rs"),
         include_str!("location.rs"),
+        include_str!("map.rs"),
+        include_str!("objective.rs"),
         include_str!("model.rs"),
         include_str!("sheet.rs"),
         include_str!("scene.rs"),

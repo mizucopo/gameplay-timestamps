@@ -35,19 +35,21 @@ fn has(text: &str, words: &[&str]) -> bool {
     words.iter().any(|word| text.contains(word))
 }
 
+pub(crate) fn resumes_play(e: &Event) -> bool {
+    has(
+        &e.heading,
+        &[
+            "プレイ再開",
+            "プレイを再開",
+            "ゲーム再開",
+            "ゲームを再開",
+            "ロードから再開",
+        ],
+    )
+}
+
 fn protected(e: &Event) -> bool {
-    e.start == 0
-        || e.screen_label.is_some()
-        || has(
-            &e.heading,
-            &[
-                "プレイ再開",
-                "プレイを再開",
-                "ゲーム再開",
-                "ゲームを再開",
-                "ロードから再開",
-            ],
-        )
+    e.start == 0 || e.screen_label.is_some() || resumes_play(e)
 }
 
 fn conversation(e: &Event) -> bool {
@@ -188,6 +190,16 @@ fn battle_heading(heading: &str) -> bool {
             "戦開始",
         ],
     )
+}
+
+pub(crate) fn chapter_priority(event: &Event) -> u8 {
+    if protected(event) {
+        2
+    } else if milestone(event) || battle_heading(&event.heading) {
+        1
+    } else {
+        0
+    }
 }
 
 fn action_on_screen(e: &Event) -> bool {

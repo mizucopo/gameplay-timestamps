@@ -126,7 +126,7 @@ fn destinations(text: &str, clipped: bool) -> BTreeSet<String> {
         .collect()
 }
 
-fn explicit_place(line: &str) -> Option<&str> {
+pub(crate) fn explicit_place(line: &str) -> Option<&str> {
     let (label, name) = line.split_once(['：', ':'])?;
     ["現在地", "場所", "エリア", "地名"]
         .contains(&label)
