@@ -13,6 +13,7 @@ use crate::{
 };
 
 const LOOKBACK: u64 = 180;
+const MIN_LEAD: u64 = 6;
 
 fn later_outcome(e: &Event) -> bool {
     e.start > 0
@@ -46,6 +47,16 @@ fn later_outcome(e: &Event) -> bool {
         ]
         .iter()
         .any(|word| e.heading.contains(word))
+}
+
+/// A conversation with a separate introduction and outcome gives viewers a
+/// chapter to seek to even when the new start is close to another entry.
+pub(crate) fn has_conversation_intro(e: &Event) -> bool {
+    later_outcome(e)
+        && e.seen.saturating_sub(e.start) >= MIN_LEAD
+        && e.start_image
+            .as_deref()
+            .is_some_and(|image| image != e.evidence_image)
 }
 
 fn letters(s: &str) -> String {
@@ -347,14 +358,14 @@ fn revise(e: &mut Event, a: &Analyzer<'_>, video: &Path, cues: &[Cue], floor: u6
     let Some(proposed) = action.or(audio).or(fade) else {
         return Ok(());
     };
-    if proposed >= e.start || proposed + 5 >= e.seen {
+    if proposed >= e.start || e.seen.saturating_sub(proposed) < MIN_LEAD {
         return Ok(());
     }
     // A second talk command may begin another character's conversation
     // without a fade or a long pause between the two sets of subtitles.
     let action = interaction(&frames, proposed + 1..=e.seen, a)?.or(action);
     let start = action.unwrap_or(proposed);
-    if start >= e.start || start + 5 >= e.seen {
+    if start >= e.start || e.seen.saturating_sub(start) < MIN_LEAD {
         return Ok(());
     }
     let (connected, echo) = corroborated(&frames, start, e.seen, &e.heading, cues, a)?;
