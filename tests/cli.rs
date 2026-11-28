@@ -62,8 +62,12 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
             } else {
                 None
             };
-            let answer = if prompt.contains("原寸の1コマ") {
-                ensure!(!prompt.contains("炎角の鳥") && !prompt.contains("古い実"));
+            let answer = if prompt.contains("原寸の1コマ") || prompt.contains("gauge_y") {
+                ensure!(
+                    !["炎角の鳥", "古い実", "銀の怪鳥", "蒼の騎士", "紅の騎士"]
+                        .iter()
+                        .any(|s| prompt.contains(s))
+                );
                 let url = body["messages"][1]["content"][1]["image_url"]["url"]
                     .as_str()
                     .unwrap();
@@ -76,7 +80,19 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
                 );
                 let [r, g, b] = picture.get_pixel(48, 27).0;
                 let properties = &body["response_format"]["json_schema"]["schema"]["properties"];
-                if properties.get("action").is_some() {
+                if properties.get("gauge_y").is_some() {
+                    if body["model"] == "unreliable-hud-position" {
+                        json!({"role":"entrance","literal":"","gauge_x":50,"gauge_y":50})
+                    } else if g > 140 && b > 140 {
+                        json!({"role":"hud","literal":"蒼の騎士","gauge_x":50,"gauge_y":18})
+                    } else if r > 170 && b > 170 && g < 70 {
+                        json!({"role":"title","literal":"紅の騎士","gauge_x":0,"gauge_y":0})
+                    } else if r > 165 && (65..130).contains(&g) && b < 100 {
+                        json!({"role":"hud","literal":"紅の騎士","gauge_x":50,"gauge_y":18})
+                    } else {
+                        json!({"role":"other","literal":"","gauge_x":0,"gauge_y":0})
+                    }
+                } else if properties.get("action").is_some() {
                     ensure!(
                         properties.get("subject").is_none(),
                         "the combat stage has a separate reading"
@@ -354,7 +370,18 @@ fn silent_recording_keeps_distinct_starts_and_links_later_evidence() -> Result<(
 fn cached_enemy_guesses_are_checked_at_their_original_frame_before_publication() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let video = tmp.path().join("scene.mp4");
-    let filter = "drawbox=color=green:t=fill:enable='between(t,2,3)',drawbox=color=blue:t=fill:enable='eq(t,4)',drawbox=color=cyan:t=fill:enable='gte(t,5)',drawbox=x=4:y=4:w=10:h=10:color=white:t=fill:enable='eq(t,2)',drawbox=color=yellow:t=fill:enable='eq(t,8)'";
+    let filter = [
+        "drawbox=color=green:t=fill:enable='between(t,2,3)'",
+        "drawbox=color=blue:t=fill:enable='eq(t,4)'",
+        "drawbox=color=cyan:t=fill:enable='between(t,5,10)'",
+        "drawbox=x=4:y=4:w=10:h=10:color=white:t=fill:enable='eq(t,2)'",
+        "drawbox=color=magenta:t=fill:enable='eq(t,11)'",
+        "drawbox=color=black:t=fill:enable='gte(t,12)'",
+        "drawbox=color=0xeb6342:t=fill:enable='between(t,13,14)+between(t,18,19)+gte(t,150)'",
+        "drawbox=color=yellow:t=fill:enable='eq(t,8)+eq(t,30)'",
+        "drawbox=x=18:y=9:w=60:h=2:color=white:t=fill:enable='between(t,5,10)+between(t,13,14)+between(t,18,19)+eq(t,30)+gte(t,150)'",
+        "drawbox=x=6:y=42:w=8:h=5:color=blue:t=fill:enable='eq(t,6)+eq(t,10)+eq(t,14)+eq(t,19)+eq(t,151)'",
+    ].join(",");
     ensure!(
         Command::new("ffmpeg")
             .args([
@@ -364,9 +391,9 @@ fn cached_enemy_guesses_are_checked_at_their_original_frame_before_publication()
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=red:s=96x54:r=1:d=10",
+                "color=c=red:s=96x54:r=1:d=152",
                 "-vf",
-                filter,
+                &filter,
                 "-an",
                 "-c:v",
                 "mpeg4"
@@ -426,14 +453,17 @@ fn cached_enemy_guesses_are_checked_at_their_original_frame_before_publication()
             "start_image":format!("frames/{start:08}.jpg"),"evidence_image":format!("frames/{seen:08}.jpg")
         })
     };
-    let mut verified = event(
-        7,
-        7,
-        "銀の怪鳥戦開始",
-        "2フレームの敵名と体力ゲージ",
-        "7 銀の怪鳥",
-    );
-    verified["screen_label"] = json!("銀の怪鳥");
+    let tracked = |sec, name: &str| {
+        let mut e = event(
+            sec,
+            sec,
+            &format!("{name}戦開始"),
+            "2フレームの敵名と体力ゲージ",
+            &format!("{sec} {name}"),
+        );
+        e["screen_label"] = json!(name);
+        e
+    };
     let original = json!([
         event(0, 0, "動画開始", "録画の先頭", ""),
         event(0, 4, "ボス「炎角の鳥」登場", "翼を広げたような赤い衣装", ""),
@@ -478,7 +508,15 @@ fn cached_enemy_guesses_are_checked_at_their_original_frame_before_publication()
             "9 敵名：蒼の騎士"
         ),
         event(8, 8, "敵との戦闘に敗北", "結果画面の表示", "8 DEFEAT"),
-        verified,
+        tracked(5, "蒼の騎士"),
+        tracked(6, "蒼の騎士"),
+        tracked(7, "銀の怪鳥"),
+        tracked(9, "蒼の騎士"),
+        tracked(11, "紅の騎士"),
+        tracked(18, "紅の騎士"),
+        // The actual loss at 30 is absent from the observations. The second
+        // red opponent appears two minutes later with the same name and HUD.
+        tracked(150, "紅の騎士"),
         event(7, 7, "白角のうさぎを倒す", "画面上の目的欄", ""),
         event(
             7,
@@ -497,12 +535,13 @@ fn cached_enemy_guesses_are_checked_at_their_original_frame_before_publication()
     ]);
     let bytes = serde_json::to_vec(&original)?;
     fs::write(obs.join("events.json"), &bytes)?;
+    let mut calls_cached = None;
     for dest in ["corrected", "repeat"] {
         run(dest)?;
         let path = tmp.path().join(dest);
         assert_eq!(
             fs::read_to_string(path.join("timestamps.txt"))?,
-            "0:00 動画開始\n0:03 風見の実を入手\n0:03 石碑の発見\n0:04 装備のクローズアップ\n0:05 ボス「蒼の騎士」の攻撃をガード成功\n0:07 銀の怪鳥戦開始\n0:07 白角のうさぎを倒す\n0:07 依頼「探索中に敵と遭遇」を受注\n0:07 衛兵と敵との戦闘について話す\n0:08 戦闘に敗北\n0:09 ボス「蒼の騎士」の攻撃をガード成功\n"
+            "0:00 動画開始\n0:03 風見の実を入手\n0:03 石碑の発見\n0:04 装備のクローズアップ\n0:05 ボス「蒼の騎士」の攻撃をガード成功\n0:05 蒼の騎士戦開始\n0:07 白角のうさぎを倒す\n0:07 依頼「探索中に敵と遭遇」を受注\n0:07 衛兵と敵との戦闘について話す\n0:08 戦闘に敗北\n0:09 ボス「蒼の騎士」の攻撃をガード成功\n0:09 蒼の騎士戦開始\n0:11 紅の騎士戦開始\n2:30 紅の騎士戦開始\n"
         );
         let raw = fs::read_to_string(path.join("evidence.jsonl"))?;
         assert!(!raw.contains("炎角の鳥") && !raw.contains("古い実"));
@@ -514,14 +553,141 @@ fn cached_enemy_guesses_are_checked_at_their_original_frame_before_publication()
         assert_eq!(rows[3]["seen"], 4);
         assert_eq!(rows[4]["start_image"], "frames/00000005.jpg");
         assert_eq!(rows[4]["evidence_image"], "frames/00000006.jpg");
-        assert_eq!(rows.last().unwrap()["start_image"], "frames/00000009.jpg");
+        let intro = &rows[rows.len() - 2];
+        assert_eq!(intro["start_image"], "frames/00000011.jpg");
+        assert_eq!(intro["evidence_image"], "frames/00000013.jpg");
+        assert_eq!(intro["seen"], 13);
+        assert_eq!(rows.last().unwrap()["start_image"], "frames/00000150.jpg");
         assert_eq!(fs::read(obs.join("events.json"))?, bytes);
+        let entries = fs::read_dir(&cache)?
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|v| v == "json"))
+            .count();
+        if let Some(previous) = calls_cached {
+            assert_eq!(entries, previous);
+        }
+        calls_cached = Some(entries);
     }
     let mut stop =
         std::net::TcpStream::connect(base.trim_start_matches("http://").trim_end_matches("/v1"))?;
     stop.write_all(b"GET /stop HTTP/1.1\r\n\r\n")?;
-    // The guard is the only event needing a separate combat-stage reading.
-    // The cached proof and onset may be identical after MPEG compression.
-    assert!((7..=11).contains(&server.join().unwrap()?));
+    // Native HUD reads (including repeated candidates) are shared across runs.
+    let calls = server.join().unwrap()?;
+    assert!((10..=42).contains(&calls), "{calls} model calls");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn native_enemy_name_must_be_attached_to_a_stable_meter_even_with_a_wrong_model_position()
+-> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let video = tmp.path().join("hud.mp4");
+    let filter = [
+        "drawbox=x=16:y=11:w=64:h=2:color=white:t=fill",
+        "drawbox=x=3:y=35:w=4:h=3:color=lime:t=fill:enable='between(t,2,3)'",
+        "drawbox=x=11:y=35:w=4:h=3:color=lime:t=fill:enable='between(t,2,3)'",
+        "drawbox=x=41:y=9:w=4:h=3:color=lime:t=fill:enable='between(t,5,6)+between(t,8,9)'",
+        "drawbox=x=52:y=9:w=4:h=3:color=lime:t=fill:enable='between(t,5,6)+between(t,8,9)'",
+        "drawbox=x=85:y=45:w=5:h=6:color=red:t=fill:enable='eq(t,3)+eq(t,6)+eq(t,9)'",
+    ]
+    .join(",");
+    ensure!(
+        Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=96x54:r=1:d=10",
+                "-vf",
+                &filter,
+                "-c:v",
+                "mpeg4"
+            ])
+            .arg(&video)
+            .status()?
+            .success()
+    );
+    let ocr = tmp.path().join("read-name");
+    fs::write(
+        &ocr,
+        r#"#!/usr/bin/env python3
+import subprocess,sys
+data=subprocess.check_output(["ffmpeg","-v","error","-i","pipe:0","-f","rawvideo","-pix_fmt","rgb24","pipe:1"],input=sys.stdin.buffer.read())
+if sum(g>100 and g>r+40 and g>b+40 for r,g,b in zip(data[::3],data[1::3],data[2::3]))>=19:
+    print("蒼の騎士")
+"#,
+    )?;
+    fs::set_permissions(&ocr, fs::Permissions::from_mode(0o755))?;
+    let (base, server) = model()?;
+    let cache = tmp.path().join("cache");
+    let run = |dir: &str| -> Result<()> {
+        let out = Command::new(env!("CARGO_BIN_EXE_gameplay-timestamps"))
+            .arg("敵役の検証")
+            .arg(&video)
+            .args([
+                "--api-base",
+                &base,
+                "--model",
+                "unreliable-hud-position",
+                "--search",
+                "off",
+                "--no-audio",
+                "--ocr-command",
+            ])
+            .arg(&ocr)
+            .arg("--inference-cache")
+            .arg(&cache)
+            .arg("-o")
+            .arg(tmp.path().join(dir))
+            .output()?;
+        ensure!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    };
+    run("seed")?;
+    let obs = fs::read_dir(&cache)?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("observations-")
+        })
+        .unwrap()
+        .path();
+    ensure!(
+        Command::new("ffmpeg")
+            .args(["-nostdin", "-y", "-v", "error", "-i"])
+            .arg(&video)
+            .args(["-start_number", "0", "-q:v", "3"])
+            .arg(obs.join("frames/%08d.jpg"))
+            .status()?
+            .success()
+    );
+    let mut events = vec![
+        json!({"start":0,"seen":0,"heading":"動画開始","basis":"録画の先頭","ocr":"","start_image":"frames/00000000.jpg","evidence_image":"frames/00000000.jpg"}),
+    ];
+    for sec in [2, 5, 8] {
+        let path = format!("frames/{sec:08}.jpg");
+        events.push(json!({"start":sec,"seen":sec,"heading":"蒼の騎士戦開始","basis":"敵名・体力ゲージを照合","ocr":format!("{sec} 蒼の騎士"),"screen_label":"蒼の騎士","start_image":path,"evidence_image":path}));
+    }
+    fs::write(obs.join("events.json"), serde_json::to_vec(&events)?)?;
+    run("checked")?;
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("checked/timestamps.txt"))?,
+        "0:00 動画開始\n0:05 蒼の騎士戦開始\n"
+    );
+    let mut stop =
+        std::net::TcpStream::connect(base.trim_start_matches("http://").trim_end_matches("/v1"))?;
+    stop.write_all(b"GET /stop HTTP/1.1\r\n\r\n")?;
+    server.join().unwrap()?;
     Ok(())
 }

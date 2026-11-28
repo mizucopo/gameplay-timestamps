@@ -1,5 +1,7 @@
 //! Check unverified enemy identities against their original evidence picture,
 //! after captions and the dictionary have had their last opportunity to name them.
+mod encounter;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -167,8 +169,8 @@ fn event_clause(heading: &str) -> &str {
 
 pub(crate) fn needs_check(event: &Event) -> bool {
     if event.screen_label.is_some() {
-        // The HUD tracker already independently checked the same enemy name
-        // and health bar on two frames. Other tracked labels are objectives or places.
+        // Tracked encounters have their own native-frame check. Other
+        // tracked labels refer to objectives or places.
         return false;
     }
     let h = event_clause(&event.heading);
@@ -832,6 +834,32 @@ fn battle_boundary(event: &Event) -> bool {
 }
 
 pub fn verify(
+    events: &mut Vec<Event>,
+    cues: &[Cue],
+    dictionary: &Dictionary,
+    analyzer: &Analyzer<'_>,
+    video: &Path,
+    before_naming: &[bool],
+) {
+    let mut boundaries: BTreeSet<_> = events
+        .iter()
+        .filter(|e| encounter::recorded_boundary(e))
+        .map(|e| e.seen)
+        .collect();
+    verify_candidates(events, cues, dictionary, analyzer, video, before_naming);
+    boundaries.extend(
+        events
+            .iter()
+            .filter(|e| {
+                encounter::recorded_boundary(e)
+                    || e.basis.starts_with("元画像で戦闘の決着表示を確認")
+            })
+            .map(|e| e.seen),
+    );
+    encounter::verify(events, analyzer, video, &boundaries);
+}
+
+fn verify_candidates(
     events: &mut Vec<Event>,
     cues: &[Cue],
     dictionary: &Dictionary,
