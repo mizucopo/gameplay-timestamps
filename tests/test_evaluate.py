@@ -128,6 +128,9 @@ class EvaluationTest(unittest.TestCase):
             evaluate.compare_revisions(before, {"recordings": []})
         with self.assertRaisesRegex(ValueError, "events"):
             evaluate.compare_revisions(before, {"recordings": [{**new, "events": {}}]})
+        changed = {**events, "early": {**events["early"], "evidence": "別の場面で同じ台詞が出る"}}
+        with self.assertRaisesRegex(ValueError, "events"):
+            evaluate.compare_revisions(before, {"recordings": [{**new, "events": changed}]})
 
     def test_uncertain_row_keeps_the_reason_inside_a_surveyed_interval(self):
         files = self.reviewed("run", [

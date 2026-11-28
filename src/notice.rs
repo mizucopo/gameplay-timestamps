@@ -2,12 +2,14 @@
 //! objective or conversation. A reading in two source seconds is required.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::Path,
 };
 
 use anyhow::{Context, Result};
-use image::{ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
+use image::{
+    DynamicImage, GenericImage, ImageFormat, RgbImage, codecs::jpeg::JpegEncoder,
+    imageops::FilterType,
+};
 
 use crate::{
     analyze::{Analyzer, Event, Scan, japanese, save},
@@ -118,7 +120,7 @@ impl Reading {
     }
 }
 
-fn crop(frame: &Frame, zoom: bool) -> Result<Vec<u8>> {
+fn crop(frame: &Frame, zoom: bool) -> Result<DynamicImage> {
     let img = image::load_from_memory_with_format(&frame.jpeg, ImageFormat::Jpeg)?;
     let (w, h) = (img.width(), img.height());
     // The full-size band preserves broad titles, the tighter enlargement
@@ -144,15 +146,43 @@ fn crop(frame: &Frame, zoom: bool) -> Result<Vec<u8>> {
             )
             .unsharpen(0.8, 3);
     }
+    Ok(region)
+}
+
+fn recognize(img: &DynamicImage, command: Option<&Path>) -> Result<String> {
     let mut bytes = Vec::new();
-    JpegEncoder::new_with_quality(&mut bytes, 92).encode_image(&region)?;
-    Ok(bytes)
+    JpegEncoder::new_with_quality(&mut bytes, 92).encode_image(img)?;
+    ocr::read(&bytes, command)
+}
+
+// The sheet only nominates source seconds. Its text can never supply a name
+// or a phase in an event; those must be read from individual source images.
+fn screen_group(
+    group: &[(u64, DynamicImage)],
+    command: Option<&Path>,
+    seeds: &mut BTreeSet<u64>,
+) -> Result<()> {
+    if group.is_empty() {
+        return Ok(());
+    }
+    let w = group.iter().map(|(_, img)| img.width()).max().unwrap();
+    let h = group.iter().map(|(_, img)| img.height()).max().unwrap();
+    let cols = group.len().min(2) as u32;
+    let rows = (group.len() as u32).div_ceil(cols);
+    let mut sheet = RgbImage::new(w * cols, h * rows);
+    for (i, (_, region)) in group.iter().enumerate() {
+        sheet.copy_from(&region.to_rgb8(), i as u32 % cols * w, i as u32 / cols * h)?;
+    }
+    if clue(&recognize(&DynamicImage::ImageRgb8(sheet), command)?) {
+        seeds.extend(group.iter().map(|(sec, _)| *sec));
+    }
+    Ok(())
 }
 
 fn read(frame: &Frame, command: Option<&Path>) -> Result<Reading> {
     let mut reading = Reading::default();
     for zoom in [false, true] {
-        reading.add(&ocr::read(&crop(frame, zoom)?, command)?, true);
+        reading.add(&recognize(&crop(frame, zoom)?, command)?, true);
     }
     if !reading.names.is_empty() {
         let full = ocr::read(&frame.jpeg, command)?;
@@ -196,7 +226,11 @@ fn cards(readings: &BTreeMap<u64, Reading>) -> Vec<Card> {
                 .filter(|(t, r)| {
                     **t != seen
                         && r.names.contains(title)
-                        && !r.paired.keys().any(|(s, n)| n == title && s != status)
+                        && !readings
+                            .range(seen.min(**t)..=seen.max(**t))
+                            .any(|(_, other)| {
+                                other.paired.keys().any(|(s, n)| n == title && s != status)
+                            })
                 })
                 .min_by_key(|(t, _)| t.abs_diff(seen))
                 .map(|(&t, _)| t);
@@ -211,10 +245,9 @@ fn cards(readings: &BTreeMap<u64, Reading>) -> Vec<Card> {
                 seen,
                 corroborated,
             };
-            if let Some(last) = found
-                .iter_mut()
-                .rev()
-                .find(|c| c.status == *status && c.title == *title && seen - c.seen <= 5)
+            if let Some(last) = found.iter_mut().rev().find(|c| c.title == *title)
+                && last.status == *status
+                && seen - last.seen <= 5
             {
                 last.seen = seen;
                 last.corroborated = corroborated;
@@ -263,46 +296,55 @@ fn seed_seconds(events: &[Event]) -> BTreeSet<u64> {
     seconds
 }
 
-fn merge(events: &mut Vec<Event>, notice: Event, card: &Card) {
+fn describes(heading: &str, card: &Card) -> bool {
     let phase: &[&str] = match card.status.phase {
         "完了" => &["完了", "達成", "クリア"],
         "開始" => &["開始", "受注", "引き受け"],
         _ => &["更新"],
     };
-    let mut replacement = notice;
+    if let Some((title, rest)) = heading
+        .split_once(['「', '『'])
+        .and_then(|(_, s)| s.split_once(['」', '』']))
+    {
+        return (title == card.title || numbered_title(title, &card.title))
+            && phase.iter().any(|word| rest.contains(word));
+    }
+    if let Some((_, rest)) = heading.split_once(&card.title) {
+        let rest = rest.trim_start();
+        return (rest.starts_with(['を', 'が', 'の', 'は', 'に'])
+            || phase.iter().any(|verb| rest.starts_with(verb)))
+            && phase.iter().any(|verb| rest.contains(verb));
+    }
+    ["依頼", "クエスト", "任務", "ミッション"]
+        .iter()
+        .any(|noun| {
+            heading
+                .strip_prefix(noun)
+                .is_some_and(|s| phase.contains(&s.trim_start_matches('の')))
+        })
+}
+
+fn merge(events: &mut Vec<Event>, mut notices: Vec<(Card, Event)>) {
     events.retain(|e| {
-        let quoted = e
-            .heading
-            .split_once(['「', '『'])
-            .and_then(|(_, s)| s.split_once(['」', '』']))
-            .map(|(s, _)| s);
-        let named = match quoted {
-            Some(title) => title == card.title || numbered_title(title, &card.title),
-            None => e.heading.split_once(&card.title).is_some_and(|(_, rest)| {
-                let rest = rest.trim_start();
-                rest.is_empty()
-                    || rest.starts_with(['を', 'が', 'の', 'は', 'に'])
-                    || phase.iter().any(|verb| rest.starts_with(verb))
-            }),
+        // Associate each pre-existing row with its nearest matching card.
+        // A new row can never consume another independently confirmed notice.
+        let closest = notices
+            .iter_mut()
+            .filter(|(card, _)| {
+                (card.first.saturating_sub(3)..=card.seen.saturating_add(3)).contains(&e.seen)
+                    && describes(&e.heading, card)
+            })
+            .min_by_key(|(card, _)| e.seen.abs_diff(e.seen.clamp(card.first, card.seen)));
+        let Some((_, replacement)) = closest else {
+            return true;
         };
-        let generic = ["依頼", "クエスト", "任務", "ミッション"]
-            .iter()
-            .any(|noun| {
-                e.heading
-                    .strip_prefix(noun)
-                    .is_some_and(|s| phase.contains(&s.trim_start_matches('の')))
-            });
-        let matches = e.seen >= card.first.saturating_sub(3)
-            && e.seen <= card.seen.saturating_add(3)
-            && (generic || named)
-            && phase.iter().any(|s| e.heading.contains(s));
-        if matches && e.start <= replacement.start && e.start_image.is_some() {
+        if e.start <= replacement.start && e.start_image.is_some() {
             replacement.start = e.start;
             replacement.start_image = e.start_image.clone();
         }
-        !matches
+        false
     });
-    events.push(replacement);
+    events.extend(notices.into_iter().map(|(_, e)| e));
 }
 
 pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) -> Result<()> {
@@ -310,44 +352,23 @@ pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) ->
         return Ok(());
     }
     let mut seeds = seed_seconds(&scan.events);
-    let mut visited = BTreeSet::new();
-    for event in &scan.events {
-        if !visited.insert(event.seen)
-            || seeds
-                .range(event.seen.saturating_sub(2)..=event.seen.saturating_add(2))
-                .next()
-                .is_some()
-        {
-            continue;
+    let mut group = Vec::with_capacity(4);
+    let mut previous = None;
+    let sweep = media::scan(video, step, |frame| {
+        // Anchor the groups on the playback grid so nominations elsewhere
+        // cannot change how later, unrelated frames are presented to OCR.
+        let block = frame.second / (4 * u64::from(step));
+        if previous.replace(block).is_some_and(|prev| prev != block) {
+            screen_group(&group, a.ocr_command, &mut seeds)?;
+            group.clear();
         }
-        let frame = Frame {
-            second: event.seen,
-            jpeg: fs::read(a.dir.join(&event.evidence_image))?,
-        };
-        let result = ocr::read(&crop(&frame, false)?, a.ocr_command);
-        match result {
-            Ok(text) if text.lines().any(|line| status(line).is_some()) => {
-                seeds.insert(frame.second);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("依頼通知を再読できません ({error})");
-                return Ok(());
-            }
+        if !seeds.contains(&frame.second) && !scan.cursor_seconds.contains(&frame.second) {
+            group.push((frame.second, crop(&frame, false)?));
         }
-    }
-    // A silent recording can have no proposed event at all. In that case
-    // there are no evidence images to revisit beyond the opening. Search
-    // the recording on the CLI's sampling grid for the same visual marker.
-    if scan.events.len() == 1
-        && let Err(error) = media::scan(video, step, |frame| {
-            let text = ocr::read(&crop(&frame, false)?, a.ocr_command)?;
-            if text.lines().any(|line| status(line).is_some()) {
-                seeds.insert(frame.second);
-            }
-            Ok(())
-        })
-    {
+        Ok(())
+    })
+    .and_then(|()| screen_group(&group, a.ocr_command, &mut seeds));
+    if let Err(error) = sweep {
         eprintln!("依頼通知の追加走査を続けられません ({error})");
         return Ok(());
     }
@@ -374,6 +395,7 @@ pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) ->
             }
         }
     }
+    let mut notices = Vec::new();
     for card in cards(&readings) {
         let frames = speech::frames::sample(video, vec![card.first, card.seen])?;
         let first = frames
@@ -390,7 +412,7 @@ pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) ->
                 card.status.noun, card.title, card.status.phase
             ),
             basis: format!(
-                "{}秒の通知に「{}」「{}」を表示、{}秒の別画面でも同名を確認",
+                "{}秒の通知に「{}」「{}」を表示、{}秒にも同名を表示",
                 card.seen, card.header, card.title, card.corroborated
             ),
             start_image: Some(save(a.dir, first)?),
@@ -401,8 +423,9 @@ pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) ->
                 card.seen, card.header, card.seen, card.title, card.corroborated, card.title
             ),
         };
-        merge(&mut scan.events, event, &card);
+        notices.push((card, event));
     }
+    merge(&mut scan.events, notices);
     scan.events.sort_by_key(|e| e.start);
     Ok(())
 }
@@ -416,6 +439,80 @@ mod tests {
         r.add(crop, true);
         r.add(full, false);
         r
+    }
+
+    fn event(start: u64, seen: u64, heading: &str) -> Event {
+        Event {
+            start,
+            seen,
+            heading: heading.into(),
+            basis: String::new(),
+            start_image: Some(format!("frames/{start:08}.jpg")),
+            evidence_image: format!("frames/{seen:08}.jpg"),
+            screen_label: None,
+            ocr: String::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_card_outside_an_unrelated_observation_is_recovered() -> Result<()> {
+        use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+        let tmp = tempfile::tempdir()?;
+        let video = tmp.path().join("game.mkv");
+        let run = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=160x90:r=1:d=22",
+                "-vf",
+                "drawbox=x=44:y=15:w=50:h=8:color=blue:t=fill:enable='between(t,14,15)'",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&video)
+            .status()?;
+        assert!(run.success());
+        let adapter = tmp.path().join("read-color");
+        fs::write(
+            &adapter,
+            r#"#!/usr/bin/env python3
+import subprocess, sys
+pixels = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', 'pipe:0', '-vf', 'scale=48:30',
+    '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1'], input=sys.stdin.buffer.read())
+if any(b > 150 and b > r + 60 for r, g, b in zip(pixels[::3], pixels[1::3], pixels[2::3])):
+    print('クエスト完了\n北の渡し')
+"#,
+        )?;
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755))?;
+        fs::create_dir(tmp.path().join("frames"))?;
+        let model = crate::model::Model::connect("http://localhost", Some("unused".into()), None)?;
+        let analyzer = Analyzer {
+            game: "",
+            edition: "",
+            model: &model,
+            dir: tmp.path(),
+            use_ocr: true,
+            ocr_command: Some(&adapter),
+        };
+        let mut scan = Scan {
+            events: vec![event(0, 0, "動画開始"), event(5, 5, "石碑を発見")],
+            cursor_seconds: BTreeSet::new(),
+            complete: true,
+        };
+        supplement(&analyzer, &video, 1, &mut scan)?;
+        let card = scan.events.last().unwrap();
+        assert_eq!(
+            (card.start, card.seen, card.heading.as_str()),
+            (14, 15, "クエスト「北の渡し」完了")
+        );
+        assert!(tmp.path().join(&card.evidence_image).is_file());
+        assert_eq!(scan.events[1].heading, "石碑を発見");
+        Ok(())
     }
 
     #[test]
@@ -462,6 +559,52 @@ mod tests {
     }
 
     #[test]
+    fn a_title_containing_the_phase_word_and_a_close_restart_keep_their_own_proofs() {
+        let mut reads = BTreeMap::new();
+        for (second, phase) in [
+            (14, "開始"),
+            (15, "開始"),
+            (16, "完了"),
+            (17, "完了"),
+            (18, "開始"),
+            (19, "開始"),
+        ] {
+            reads.insert(
+                second,
+                screen(&format!("クエスト{phase}\n任務完了の証"), ""),
+            );
+        }
+        let mut events = vec![
+            event(11, 14, "クエスト「任務完了の証」開始"),
+            event(18, 19, "任務完了の証を受注"),
+        ];
+        let notices = cards(&reads)
+            .into_iter()
+            .map(|c| {
+                assert!((c.first..=c.seen).contains(&c.corroborated));
+                let e = event(
+                    c.first,
+                    c.seen,
+                    &format!("クエスト「{}」{}", c.title, c.status.phase),
+                );
+                (c, e)
+            })
+            .collect();
+        merge(&mut events, notices);
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.start, e.seen, e.heading.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (11, 15, "クエスト「任務完了の証」開始"),
+                (16, 17, "クエスト「任務完了の証」完了"),
+                (18, 19, "クエスト「任務完了の証」開始"),
+            ]
+        );
+    }
+
+    #[test]
     fn the_numbered_card_replaces_its_clipped_or_generic_completion_only() {
         let reads = BTreeMap::from([
             (47, screen("クエスト完了\n島の調査", "")),
@@ -473,19 +616,9 @@ mod tests {
         ]);
         let found = cards(&reads);
         assert_eq!(found.len(), 1);
-        let card = &found[0];
+        let card = found.into_iter().next().unwrap();
         assert_eq!(card.title, "島の調査・2");
         assert_eq!(card.header, "QUEST CLEAR");
-        let event = |start, seen, heading: &str| Event {
-            start,
-            seen,
-            heading: heading.into(),
-            basis: String::new(),
-            start_image: Some(format!("frames/{start:08}.jpg")),
-            evidence_image: format!("frames/{seen:08}.jpg"),
-            screen_label: None,
-            ocr: String::new(),
-        };
         let mut events = vec![
             event(25, 48, "クエスト「島の調査」完了"),
             event(48, 48, "依頼完了"),
@@ -497,8 +630,7 @@ mod tests {
         ];
         merge(
             &mut events,
-            event(48, 49, "クエスト「島の調査・2」完了"),
-            card,
+            vec![(card, event(48, 49, "クエスト「島の調査・2」完了"))],
         );
         assert_eq!(events.len(), 5);
         assert_eq!((events[4].start, events[4].seen), (25, 49));

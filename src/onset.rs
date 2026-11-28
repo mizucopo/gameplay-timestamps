@@ -16,7 +16,7 @@ const LOOKBACK: u64 = 180;
 
 fn later_outcome(e: &Event) -> bool {
     e.start > 0
-        && e.start == e.seen
+        && e.start <= e.seen
         && e.screen_label.is_none()
         && (crate::editor::conversation(e)
             || e.heading.contains("会話")
@@ -197,15 +197,9 @@ fn talk_control(text: &str) -> bool {
 
 fn interaction(
     frames: &BTreeMap<u64, Frame>,
-    centers: &[u64],
-    floor: u64,
-    seen: u64,
+    seconds: impl IntoIterator<Item = u64>,
     a: &Analyzer<'_>,
 ) -> Result<Option<u64>> {
-    let mut seconds = BTreeSet::new();
-    for &t in centers {
-        seconds.extend(t.saturating_sub(2).max(floor)..=t.saturating_add(7).min(seen));
-    }
     let mut last = None;
     let mut count = 0;
     let mut action = None;
@@ -227,6 +221,20 @@ fn interaction(
         }
     }
     Ok(action)
+}
+
+fn near_captions(
+    frames: &BTreeMap<u64, Frame>,
+    centers: &[u64],
+    floor: u64,
+    seen: u64,
+    a: &Analyzer<'_>,
+) -> Result<Option<u64>> {
+    let seconds: BTreeSet<_> = centers
+        .iter()
+        .flat_map(|t| t.saturating_sub(2).max(floor)..=t.saturating_add(7).min(seen))
+        .collect();
+    interaction(frames, seconds, a)
 }
 
 fn corroborated(
@@ -277,7 +285,7 @@ fn corroborated(
 
 fn revise(e: &mut Event, a: &Analyzer<'_>, video: &Path, cues: &[Cue], floor: u64) -> Result<()> {
     let floor = floor.max(e.seen.saturating_sub(LOOKBACK));
-    if floor + 6 >= e.seen {
+    if floor >= e.start || floor + 6 >= e.seen {
         return Ok(());
     }
     let frames = sample(video, (floor..=e.seen).collect())?;
@@ -312,7 +320,7 @@ fn revise(e: &mut Event, a: &Analyzer<'_>, video: &Path, cues: &[Cue], floor: u6
     if fade_end.is_some() {
         centers.push(field);
     }
-    let action = interaction(&frames, &centers, field, e.seen, a)?;
+    let action = near_captions(&frames, &centers, field, e.seen, a)?;
     let fade = fade_end.and_then(|end| {
         let before = views
             .range(..end)
@@ -332,14 +340,21 @@ fn revise(e: &mut Event, a: &Analyzer<'_>, video: &Path, cues: &[Cue], floor: u6
         && fade.is_none()
         && let Some(first) = first_caption(&frames, field, e.seen, a)?
     {
-        interaction(&frames, &[first.saturating_sub(7)], field, e.seen, a)?
+        near_captions(&frames, &[first.saturating_sub(7)], field, e.seen, a)?
     } else {
         action
     };
-    let Some(start) = action.or(audio).or(fade) else {
+    let Some(proposed) = action.or(audio).or(fade) else {
         return Ok(());
     };
-    if start + 5 >= e.seen {
+    if proposed >= e.start || proposed + 5 >= e.seen {
+        return Ok(());
+    }
+    // A second talk command may begin another character's conversation
+    // without a fade or a long pause between the two sets of subtitles.
+    let action = interaction(&frames, proposed + 1..=e.seen, a)?.or(action);
+    let start = action.unwrap_or(proposed);
+    if start >= e.start || start + 5 >= e.seen {
         return Ok(());
     }
     let (connected, echo) = corroborated(&frames, start, e.seen, &e.heading, cues, a)?;
@@ -457,6 +472,7 @@ import subprocess,sys
 pixel=subprocess.check_output(["ffmpeg","-v","error","-i","pipe:0","-vf","scale=1:1","-frames:v","1","-f","rawvideo","-pix_fmt","rgb24","pipe:1"],input=sys.stdin.buffer.read())
 r,g,b=pixel
 if r>150 and g<150: print("A 話す")
+if 110<r<150 and b>130: print("リオ\n初めてこの街へ来たのですか。")
 if r<80 and b>125:
     print("セナ")
     print("誰かと思ったら、こんばんは。" if g<103 else "珍しい薬草を預かりました。" if g<125 else "持ち帰ってくださって、ありがとう。")
@@ -474,7 +490,7 @@ if r<80 and b>125:
             use_ocr: true,
             ocr_command: Some(&ocr),
         };
-        let originals = sample(&video, vec![10, 34])?;
+        let originals = sample(&video, vec![8, 10, 33, 34])?;
         let evidence = save(dir.path(), &originals[&34])?;
         let event = |heading: &str| Event {
             start: 34,
@@ -489,17 +505,43 @@ if r<80 and b>125:
         let mut unrelated = event("港の船長との和解");
         revise(&mut unrelated, &analyzer, &video, &[], 0)?;
         assert_eq!(unrelated.start, 34);
-        let mut rows = [event("セナとの感謝の会話")];
+        let mut partial = event("セナとの感謝の会話");
+        partial.start = 33;
+        partial.start_image = Some(save(dir.path(), &originals[&33])?);
+        let mut earlier = event("セナとの感謝の会話");
+        earlier.start = 8;
+        earlier.start_image = Some(save(dir.path(), &originals[&8])?);
+        let mut rows = [partial, earlier];
         refine(&mut rows, &analyzer, &video, &[]);
-        assert_eq!((rows[0].start, rows[0].seen), (10, 34));
+        assert_eq!((rows[0].start, rows[0].seen), (8, 34));
+        assert_eq!((rows[1].start, rows[1].seen), (10, 34));
         assert_eq!(
-            fs::read(dir.path().join(rows[0].start_image.as_ref().unwrap()))?,
+            fs::read(dir.path().join(rows[1].start_image.as_ref().unwrap()))?,
             originals[&10].jpeg
         );
         assert_eq!(
-            fs::read(dir.path().join(&rows[0].evidence_image))?,
+            fs::read(dir.path().join(&rows[1].evidence_image))?,
             originals[&34].jpeg
         );
+        let second = dir.path().join("two-conversations.mp4");
+        let changes = [
+            "drawbox=color=0x83719c:t=fill:enable='between(t,11,20)'",
+            "drawbox=color=0xbf7038:t=fill:enable='between(t,21,22)'",
+            "drawbox=color=0x305a93:t=fill:enable='between(t,23,26)'",
+        ]
+        .join(",");
+        assert!(
+            Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-i"])
+                .arg(&video)
+                .args(["-vf", &changes, "-c:v", "mpeg4"])
+                .arg(&second)
+                .status()?
+                .success()
+        );
+        let mut last_speaker = event("セナとの感謝の会話");
+        revise(&mut last_speaker, &analyzer, &second, &[], 0)?;
+        assert_eq!((last_speaker.start, last_speaker.seen), (22, 34));
         Ok(())
     }
 }

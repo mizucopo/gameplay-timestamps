@@ -192,10 +192,6 @@ def compare_revisions(before, after):
         require(len(reports) == len(study["recordings"]), "duplicate recording title in score report")
         return reports
 
-    def targets(record):
-        return {key: (event["heading"], event["start"], event.get("names", {}), event.get("numbers", {}))
-                for key, event in record["events"].items()}
-
     old_records, new_records = by_title(before), by_title(after)
     require(old_records.keys() == new_records.keys() and old_records, "recordings differ or are empty")
     results = []
@@ -203,7 +199,7 @@ def compare_revisions(before, after):
         new = new_records[title]
         for field in ("split", "duration_seconds", "intervals"):
             require(old[field] == new[field], f"{title}: {field} differs between revisions")
-        require(targets(old) == targets(new), f"{title}: reference events or their start windows differ")
+        require(old["events"] == new["events"], f"{title}: reference events differ between revisions")
         conditions = {}
         for label in sorted(old["runs"].keys() & new["runs"].keys()):
             previous, current = old["runs"][label], new["runs"][label]
