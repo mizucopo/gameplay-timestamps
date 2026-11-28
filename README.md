@@ -26,7 +26,7 @@ llama-server -m /path/to/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
 
 実行後に表示される `Part5.timestamps/timestamps.txt` を開いてください。先頭は `0:00`、1時間以降は `1:00:00` の形式です。`evidence.jsonl` の各行は同じ順の見出しに対応します。`start` と `start_image` は導入、`seen` と `evidence_image` は判定の根拠です。たとえば会話の途中で依頼名が出た場合、両者の時刻は別になります。映像トラックが遅れて始まる録画では、先頭行の `start_image` は `null`、`evidence_image` は最初に表示されたフレームです。出力がすでにある場合は `-o 別のディレクトリ` を指定してください。
 
-タイムスタンプだけを貼ったときに日本語の動画説明欄へ収まるよう、改行を含めて半角換算5,000文字までにします。超える場合は録画の先頭と最後、プレイ再開とその直後の場面紹介、依頼や戦闘などの節目を優先し、同じ優先度では録画全体に分散させます。予約文字の `<` と `>` は貼り付け用には全角にします。行を選んだり表記を調整した場合、元の全行と根拠を `timestamps-full.txt` と `evidence-full.jsonl` に保存します。[YouTube ヘルプの日本語の文字数制限](https://support.google.com/youtube/answer/12948449?hl=ja)
+タイムスタンプだけを貼ったときに日本語の動画説明欄へ収まるよう、改行を含めて半角換算5,000文字までにします。超える場合は録画の先頭と最後、プレイ再開とその直後の場面紹介、依頼や戦闘などの節目を優先します。感謝や報告の会話も、導入と後の台詞にそれぞれの根拠画像があれば優先します。同じ優先度の行は録画全体に分散させます。予約文字の `<` と `>` は貼り付け用には全角にします。行を選んだり表記を調整した場合、元の全行と根拠を `timestamps-full.txt` と `evidence-full.jsonl` に保存します。[YouTube ヘルプの日本語の文字数制限](https://support.google.com/youtube/answer/12948449?hl=ja)
 
 | 用途 | 指定 |
 | --- | --- |
@@ -47,7 +47,7 @@ llama-server -m /path/to/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
 
 映像と中間画像の処理にはループバック上のモデルを使います。外部の辞書検索に使う情報は作品名・版・照会語です。[作品別辞書と OCR](docs/dictionary.md)・[vLLM の画像入力](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
 
-開発用7作品で音声・辞書を併用したとき、手作業の見本153件中52件に対応しました。設定を固定して試した別録画では、連続調査で確認した7件中1件に対応しました。[作品別の全29条件の結果](docs/evaluation-comparison.md)・[頭出しの実例と失敗例](docs/evaluation-results.md)・[採点方法](docs/evaluation.md)
+音声と辞書を併用した開発用7作品で、手作業の見本と映像から追加した計207件を比較しました。概要欄で拾えた出来事は初版の59件から60件（新規5件、消失4件）、許容範囲内から頭出しできたものは18件から21件になりました。初版を手作業の見本だけで採点した結果は153件中52件、開発に使わなかった別録画での結果は7件中1件です。[7作品の検出と頭出しの比較](docs/evaluation-issues-8-9.md)・[初版の全29条件](docs/evaluation-comparison.md)・[頭出しの実例と失敗例](docs/evaluation-results.md)・[採点方法](docs/evaluation.md)
 
 ### Apple Silicon Mac で日本語の発話を使う
 
