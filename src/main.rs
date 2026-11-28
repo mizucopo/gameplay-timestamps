@@ -8,9 +8,11 @@ mod location;
 mod map;
 mod media;
 mod model;
+mod notice;
 mod objective;
 mod observations;
 mod ocr;
+mod onset;
 mod opponent;
 mod quest;
 mod scene;
@@ -147,6 +149,7 @@ fn generate(args: Args) -> Result<PathBuf> {
         args.step,
         args.inference_cache.as_deref(),
     )?;
+    notice::supplement(&analyzer, &video, args.step, &mut scan)?;
     speech::supplement(&analyzer, &video, &subtitles, &mut scan)?;
     let mut events = scan.events;
     editor::refine(&mut events, &model, &args.game);
@@ -160,6 +163,7 @@ fn generate(args: Args) -> Result<PathBuf> {
         &video,
         &opponent_claims,
     );
+    onset::refine(&mut events, &analyzer, &video, &subtitles);
     // Keep the source opening until every later proof has had a chance to move
     // a provisional event away from zero. A meaningful zero-second event can
     // now stand in for the generic opening.
