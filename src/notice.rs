@@ -8,7 +8,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use image::{ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
-use sha2::{Digest, Sha256};
 
 use crate::{
     analyze::{Analyzer, Event, Scan, japanese, save},
@@ -90,7 +89,6 @@ fn name(raw: &str) -> Option<String> {
 
 #[derive(Default)]
 struct Reading {
-    source: [u8; 32],
     names: BTreeSet<String>,
     paired: BTreeMap<(Status, String), String>,
 }
@@ -152,10 +150,7 @@ fn crop(frame: &Frame, zoom: bool) -> Result<Vec<u8>> {
 }
 
 fn read(frame: &Frame, command: Option<&Path>) -> Result<Reading> {
-    let mut reading = Reading {
-        source: Sha256::digest(&frame.jpeg).into(),
-        ..Default::default()
-    };
+    let mut reading = Reading::default();
     for zoom in [false, true] {
         reading.add(&ocr::read(&crop(frame, zoom)?, command)?, true);
     }
@@ -200,7 +195,6 @@ fn cards(readings: &BTreeMap<u64, Reading>) -> Vec<Card> {
                 .range(seen.saturating_sub(3)..=seen.saturating_add(3))
                 .filter(|(t, r)| {
                     **t != seen
-                        && r.source != reading.source
                         && r.names.contains(title)
                         && !r.paired.keys().any(|(s, n)| n == title && s != status)
                 })
@@ -417,11 +411,8 @@ pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) ->
 mod tests {
     use super::*;
 
-    fn screen(source: u8, crop: &str, full: &str) -> Reading {
-        let mut r = Reading {
-            source: [source; 32],
-            ..Default::default()
-        };
+    fn screen(crop: &str, full: &str) -> Reading {
+        let mut r = Reading::default();
         r.add(crop, true);
         r.add(full, false);
         r
@@ -430,19 +421,17 @@ mod tests {
     #[test]
     fn requires_a_title_by_the_status_and_another_source_second() {
         let reads = BTreeMap::from([
-            (18, screen(1, "北の灯台", "")),
+            (18, screen("北の灯台", "")),
             (
                 19,
-                screen(2, "QUEST CLEAR\n北の灯台", "QUEST CLEAR\n西へ向かう"),
+                screen("QUEST CLEAR\n北の灯台", "QUEST CLEAR\n西へ向かう"),
             ),
             (
                 20,
-                screen(3, "クエスト開始\nクエスト追跡", "クエスト開始\n南の街道"),
+                screen("クエスト開始\nクエスト追跡", "クエスト開始\n南の街道"),
             ),
-            (21, screen(4, "クエスト完了時の報酬\n南の街道", "")),
-            (22, screen(5, "クエスト完了\n孤島の謎・3", "")),
-            // A held VFR picture is still only one source image.
-            (23, screen(5, "クエスト完了\n孤島の謎・3", "")),
+            (21, screen("クエスト完了時の報酬\n南の街道", "")),
+            (22, screen("クエスト完了\n孤島の謎・3", "")),
         ]);
         let found = cards(&reads);
         assert_eq!(found.len(), 1);
@@ -455,12 +444,12 @@ mod tests {
     #[test]
     fn repeated_cards_keep_started_and_completed_phases_and_a_later_repeat() {
         let reads = BTreeMap::from([
-            (100, screen(1, "クエスト開始\n島の調査・2", "")),
-            (101, screen(2, "クエスト開始\n島の調査・2", "")),
-            (104, screen(3, "クェスト完了\n島の調査・2", "")),
-            (105, screen(4, "島の調査・2", "")),
-            (200, screen(5, "クエスト開始\n島の調査・2", "")),
-            (201, screen(6, "島の調査・2", "")),
+            (100, screen("クエスト開始\n島の調査・2", "")),
+            (101, screen("クエスト開始\n島の調査・2", "")),
+            (104, screen("クェスト完了\n島の調査・2", "")),
+            (105, screen("島の調査・2", "")),
+            (200, screen("クエスト開始\n島の調査・2", "")),
+            (201, screen("島の調査・2", "")),
         ]);
         let found = cards(&reads);
         assert_eq!(
@@ -475,12 +464,12 @@ mod tests {
     #[test]
     fn the_numbered_card_replaces_its_clipped_or_generic_completion_only() {
         let reads = BTreeMap::from([
-            (47, screen(1, "クエスト完了\n島の調査", "")),
+            (47, screen("クエスト完了\n島の調査", "")),
             (
                 48,
-                screen(2, "島の調査\n島の調査・2", "QUEST CLEAR\n島の調査・2"),
+                screen("島の調査\n島の調査・2", "QUEST CLEAR\n島の調査・2"),
             ),
-            (49, screen(3, "QUEST CLEAR\n島の調査・2", "")),
+            (49, screen("QUEST CLEAR\n島の調査・2", "")),
         ]);
         let found = cards(&reads);
         assert_eq!(found.len(), 1);
