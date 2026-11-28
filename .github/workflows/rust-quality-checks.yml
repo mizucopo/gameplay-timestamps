@@ -17,9 +17,15 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
+      - name: Install FFmpeg for recording tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+
       - name: Run quality gate
         timeout-minutes: 15
         run: |
           cargo fmt --all --check
           cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all-targets --all-features
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
