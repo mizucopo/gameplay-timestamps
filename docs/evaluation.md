@@ -102,3 +102,13 @@ python3 tools/evaluate.py score /path/to/cases/*/case.json > /path/to/study-repo
 | `comparisons` | 同一録画で他方の条件を固定した比較。両側で検出した件数 `common`、新規検出 `gained`、検出消失 `lost`、各件数の差を出す。辞書比較の `corrected_count` / `regressed_count` は、両側の代表行で同じイベント・同じ欄の判定が誤→正／正→誤になった件数。新規検出や言及を省いた欄はこの分子に入らない。 |
 
 `surveyed_seconds` と区間リストを数値に添えて報告する。未調査区間の未対応行がある録画では全編を通した誤検出率を確定できない。`holdout` の結果は開発録画と分けて読む。
+
+### 変更前後の検出と頭出しを比べる
+
+同じ録画・調査区間・採点対象で変更前後の `score` を保存し、次のコマンドを実行する。
+
+```sh
+python3 tools/evaluate.py compare-revisions before.json after.json > comparison.json
+```
+
+各録画について両方にある音声・辞書の条件を照合する。`gained` と `lost` は新しく拾えた出来事と消えた出来事のID、`count_changes` は余分な行や重複を含む件数の増減。両方で拾えた出来事には、各版の代表行が開始許容範囲から何秒早いか（負）・遅いか（正）を `drift_seconds` に記録する。`entered_start_window` と `left_start_window` は、それぞれ範囲内に入ったIDと範囲外になったIDを示す。

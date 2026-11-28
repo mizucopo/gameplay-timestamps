@@ -186,6 +186,40 @@ def compare(off, on, events, compare_spelling):
     return result
 
 
+def compare_revisions(before, after):
+    def by_title(study):
+        reports = {record["recording"]: record for record in study["recordings"]}
+        require(len(reports) == len(study["recordings"]), "duplicate recording title in score report")
+        return reports
+
+    def targets(record):
+        return {key: (event["heading"], event["start"], event.get("names", {}), event.get("numbers", {}))
+                for key, event in record["events"].items()}
+
+    old_records, new_records = by_title(before), by_title(after)
+    require(old_records.keys() == new_records.keys() and old_records, "recordings differ or are empty")
+    results = []
+    for title, old in old_records.items():
+        new = new_records[title]
+        for field in ("split", "duration_seconds", "intervals"):
+            require(old[field] == new[field], f"{title}: {field} differs between revisions")
+        require(targets(old) == targets(new), f"{title}: reference events or their start windows differ")
+        conditions = {}
+        for label in sorted(old["runs"].keys() & new["runs"].keys()):
+            previous, current = old["runs"][label], new["runs"][label]
+            delta = compare(previous, current, old["events"], compare_spelling=False)
+            common = sorted(previous["matched"].keys() & current["matched"].keys())
+            drift = {key: {"before": previous["matched"][key]["drift_seconds"],
+                           "after": current["matched"][key]["drift_seconds"]} for key in common}
+            delta["drift_seconds"] = drift
+            delta["entered_start_window"] = [key for key, d in drift.items() if d["before"] != 0 and d["after"] == 0]
+            delta["left_start_window"] = [key for key, d in drift.items() if d["before"] == 0 and d["after"] != 0]
+            conditions[label] = delta
+        require(conditions, f"{title}: no shared audio/dictionary condition")
+        results.append({"recording": title, "event_count": len(old["events"]), "conditions": conditions})
+    return {"recordings": results}
+
+
 def condition(audio, dictionary):
     return f"audio_{'on' if audio else 'off'}_dictionary_{'on' if dictionary else 'off'}"
 
@@ -241,10 +275,16 @@ def main():
     sheet.add_argument("timestamps", type=Path)
     score = commands.add_parser("score", help="print per-recording scores and matched comparisons as JSON")
     score.add_argument("cases", nargs="+", type=Path)
+    revisions = commands.add_parser("compare-revisions", help="compare score reports against the same reference events")
+    revisions.add_argument("before", type=Path)
+    revisions.add_argument("after", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "sheet":
             make_sheet(args.timestamps, sys.stdout)
+            return
+        if args.command == "compare-revisions":
+            result = compare_revisions(read_json(args.before), read_json(args.after))
         else:
             reports = []
             for path in args.cases:
@@ -255,10 +295,10 @@ def main():
                 except (KeyError, TypeError, ValueError) as error:
                     raise ValueError(f"{path}: {error}") from error
                 reports.append(report)
-            json.dump({"original_lines": sum(r["original_lines"] for r in reports), "recordings": reports},
-                      sys.stdout, ensure_ascii=False, indent=2)
-            print()
-    except (OSError, ValueError, csv.Error) as error:
+            result = {"original_lines": sum(r["original_lines"] for r in reports), "recordings": reports}
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+    except (OSError, ValueError, KeyError, TypeError, csv.Error) as error:
         parser.exit(2, f"{parser.prog}: {error}\n")
 
 

@@ -96,6 +96,39 @@ class EvaluationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different output"):
             evaluate.score_lines(timestamps, self.folder / files["review"], 100, {}, [[0, 10]])
 
+    def test_revision_comparison_pairs_starts_and_separates_missing_headings(self):
+        events = {
+            key: {"id": key, "heading": key, "start": [second, second + 1]}
+            for key, second in [("early", 10), ("late", 20), ("lost", 30), ("gained", 40)]
+        }
+        condition = evaluate.condition(True, True)
+
+        def report(name, rows):
+            files = self.reviewed(name, rows)
+            run = evaluate.score_lines(self.folder / files["timestamps"], self.folder / files["review"],
+                                       60, events, [[0, 60]])
+            return {"recording": "fixture", "split": "development", "duration_seconds": 60,
+                    "events": events, "intervals": [[0, 60]], "runs": {condition: run}}
+
+        old = report("before", [("0:05 A", {"event": "early"}), ("0:20 B", {"event": "late"}),
+                                ("0:34 C", {"event": "lost"}), ("0:45 X", {"event": "-"})])
+        new = report("after", [("0:11 A", {"event": "early"}), ("0:25 B", {"event": "late"}),
+                               ("0:28 B", {"event": "late"}), ("0:40 D", {"event": "gained"})])
+        before, after = {"recordings": [old]}, {"recordings": [new]}
+        paired = evaluate.compare_revisions(before, after)["recordings"][0]["conditions"][condition]
+        self.assertEqual((paired["gained"], paired["lost"]), (["gained"], ["lost"]))
+        self.assertEqual(paired["entered_start_window"], ["early"])
+        self.assertEqual(paired["left_start_window"], ["late"])
+        self.assertEqual(paired["drift_seconds"], {
+            "early": {"before": -5, "after": 0}, "late": {"before": 0, "after": 4},
+        })
+        self.assertEqual((paired["count_changes"]["extra"], paired["count_changes"]["duplicates"]), (-1, 1))
+
+        with self.assertRaisesRegex(ValueError, "recordings differ"):
+            evaluate.compare_revisions(before, {"recordings": []})
+        with self.assertRaisesRegex(ValueError, "events"):
+            evaluate.compare_revisions(before, {"recordings": [{**new, "events": {}}]})
+
     def test_uncertain_row_keeps_the_reason_inside_a_surveyed_interval(self):
         files = self.reviewed("run", [
             ("0:04 会話", {"event": "?", "note": "話者と話題を判別できない"}),
