@@ -10,6 +10,7 @@ use image::{
     DynamicImage, GenericImage, ImageFormat, RgbImage, codecs::jpeg::JpegEncoder,
     imageops::FilterType,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     analyze::{Analyzer, Event, Scan, japanese, save},
@@ -91,6 +92,7 @@ fn name(raw: &str) -> Option<String> {
 
 #[derive(Default)]
 struct Reading {
+    picture: [u8; 32],
     names: BTreeSet<String>,
     paired: BTreeMap<(Status, String), String>,
 }
@@ -120,8 +122,7 @@ impl Reading {
     }
 }
 
-fn crop(frame: &Frame, zoom: bool) -> Result<DynamicImage> {
-    let img = image::load_from_memory_with_format(&frame.jpeg, ImageFormat::Jpeg)?;
+fn crop(img: &DynamicImage, zoom: bool) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
     // The full-size band preserves broad titles, the tighter enlargement
     // reads small subtitles and chapter numbers below the status line.
@@ -146,7 +147,7 @@ fn crop(frame: &Frame, zoom: bool) -> Result<DynamicImage> {
             )
             .unsharpen(0.8, 3);
     }
-    Ok(region)
+    region
 }
 
 fn recognize(img: &DynamicImage, command: Option<&Path>) -> Result<String> {
@@ -180,9 +181,13 @@ fn screen_group(
 }
 
 fn read(frame: &Frame, command: Option<&Path>) -> Result<Reading> {
-    let mut reading = Reading::default();
+    let img = image::load_from_memory_with_format(&frame.jpeg, ImageFormat::Jpeg)?;
+    let mut reading = Reading {
+        picture: Sha256::digest(img.as_bytes()).into(),
+        ..Default::default()
+    };
     for zoom in [false, true] {
-        reading.add(&recognize(&crop(frame, zoom)?, command)?, true);
+        reading.add(&recognize(&crop(&img, zoom), command)?, true);
     }
     if !reading.names.is_empty() {
         let full = ocr::read(&frame.jpeg, command)?;
@@ -221,19 +226,27 @@ fn cards(readings: &BTreeMap<u64, Reading>) -> Vec<Card> {
     let mut found: Vec<Card> = Vec::new();
     for (&seen, reading) in readings {
         for ((status, title), header) in &reading.paired {
+            // A phase visible for a single second can separate two showings
+            // even when it lacks the extra reading to become an event itself.
+            let same_phase = |second: u64| {
+                !readings
+                    .range(seen.min(second)..=seen.max(second))
+                    .any(|(_, other)| other.paired.keys().any(|(s, n)| n == title && s != status))
+            };
+            // Held VFR pictures can establish persistence. Prefer a distinct
+            // picture when the name is eligible for verified spelling.
+            let priority = |second: u64| {
+                (
+                    readings[&second].picture == reading.picture,
+                    second.abs_diff(seen),
+                )
+            };
             let corroborated = readings
                 .range(seen.saturating_sub(3)..=seen.saturating_add(3))
-                .filter(|(t, r)| {
-                    **t != seen
-                        && r.names.contains(title)
-                        && !readings
-                            .range(seen.min(**t)..=seen.max(**t))
-                            .any(|(_, other)| {
-                                other.paired.keys().any(|(s, n)| n == title && s != status)
-                            })
+                .filter_map(|(&t, r)| {
+                    (t != seen && r.names.contains(title) && same_phase(t)).then_some(t)
                 })
-                .min_by_key(|(t, _)| t.abs_diff(seen))
-                .map(|(&t, _)| t);
+                .min_by_key(|&t| priority(t));
             let Some(corroborated) = corroborated else {
                 continue;
             };
@@ -248,9 +261,16 @@ fn cards(readings: &BTreeMap<u64, Reading>) -> Vec<Card> {
             if let Some(last) = found.iter_mut().rev().find(|c| c.title == *title)
                 && last.status == *status
                 && seen - last.seen <= 5
+                && same_phase(last.seen)
             {
+                // A long hold at the end of a card must not discard an
+                // earlier, visually distinct witness from this same showing.
+                last.corroborated = [corroborated, last.seen, last.corroborated]
+                    .into_iter()
+                    .filter(|&t| t != seen)
+                    .min_by_key(|&t| priority(t))
+                    .unwrap();
                 last.seen = seen;
-                last.corroborated = corroborated;
                 last.header = header.clone();
             } else {
                 found.push(card);
@@ -302,26 +322,38 @@ fn describes(heading: &str, card: &Card) -> bool {
         "開始" => &["開始", "受注", "引き受け"],
         _ => &["更新"],
     };
-    if let Some((title, rest)) = heading
-        .split_once(['「', '『'])
-        .and_then(|(_, s)| s.split_once(['」', '』']))
+    let generic = |text: &str| {
+        ["依頼", "クエスト", "任務", "ミッション"]
+            .iter()
+            .any(|noun| {
+                text.strip_prefix(noun).is_some_and(|s| {
+                    phase.contains(&s.trim_start().trim_start_matches(['の', 'を']).trim())
+                })
+            })
+    };
+    let before_title = |text: &str| {
+        let text = text.trim_end_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '：' | ':' | '・' | '！' | '!')
+        });
+        phase.contains(&text) || generic(text)
+    };
+    if let Some((prefix, quoted)) = heading.split_once(['「', '『'])
+        && let Some((title, rest)) = quoted.split_once(['」', '』'])
     {
         return (title == card.title || numbered_title(title, &card.title))
-            && phase.iter().any(|word| rest.contains(word));
+            && (phase.iter().any(|word| rest.contains(word))
+                || rest.trim().is_empty() && before_title(prefix));
     }
-    if let Some((_, rest)) = heading.split_once(&card.title) {
+    if let Some((prefix, rest)) = heading.split_once(&card.title) {
         let rest = rest.trim_start();
+        if rest.is_empty() {
+            return before_title(prefix);
+        }
         return (rest.starts_with(['を', 'が', 'の', 'は', 'に'])
             || phase.iter().any(|verb| rest.starts_with(verb)))
             && phase.iter().any(|verb| rest.contains(verb));
     }
-    ["依頼", "クエスト", "任務", "ミッション"]
-        .iter()
-        .any(|noun| {
-            heading
-                .strip_prefix(noun)
-                .is_some_and(|s| phase.contains(&s.trim_start_matches('の')))
-        })
+    generic(heading)
 }
 
 fn merge(events: &mut Vec<Event>, mut notices: Vec<(Card, Event)>) {
@@ -363,7 +395,8 @@ pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) ->
             group.clear();
         }
         if !seeds.contains(&frame.second) && !scan.cursor_seconds.contains(&frame.second) {
-            group.push((frame.second, crop(&frame, false)?));
+            let img = image::load_from_memory_with_format(&frame.jpeg, ImageFormat::Jpeg)?;
+            group.push((frame.second, crop(&img, false)));
         }
         Ok(())
     })
@@ -417,7 +450,8 @@ pub fn supplement(a: &Analyzer<'_>, video: &Path, step: u32, scan: &mut Scan) ->
             ),
             start_image: Some(save(a.dir, first)?),
             evidence_image: save(a.dir, proof)?,
-            screen_label: Some(card.title.clone()),
+            screen_label: (readings[&card.seen].picture != readings[&card.corroborated].picture)
+                .then(|| card.title.clone()),
             ocr: format!(
                 "{} {}\n{} {}\n{} {}",
                 card.seen, card.header, card.seen, card.title, card.corroborated, card.title
@@ -511,6 +545,9 @@ if any(b > 150 and b > r + 60 for r, g, b in zip(pixels[::3], pixels[1::3], pixe
             (14, 15, "クエスト「北の渡し」完了")
         );
         assert!(tmp.path().join(&card.evidence_image).is_file());
+        // The held frame supports a heading, but it cannot independently
+        // verify the spelling on a second source picture.
+        assert!(card.screen_label.is_none());
         assert_eq!(scan.events[1].heading, "石碑を発見");
         Ok(())
     }
@@ -555,6 +592,82 @@ if any(b > 150 and b > r + 60 for r, g, b in zip(pixels[::3], pixels[1::3], pixe
                 .map(|c| (c.first, c.status.phase))
                 .collect::<Vec<_>>(),
             [(100, "開始"), (104, "完了"), (200, "開始")]
+        );
+    }
+
+    #[test]
+    fn another_source_picture_is_preferred_even_before_a_long_hold() {
+        let mut reads = BTreeMap::new();
+        for second in 30..=37 {
+            let mut r = screen("クエスト完了\n北の渡し", "");
+            r.picture = if second == 30 { [1; 32] } else { [2; 32] };
+            reads.insert(second, r);
+        }
+        let c = cards(&reads).pop().unwrap();
+        assert_eq!((c.first, c.seen, c.corroborated), (30, 37, 30));
+        assert_ne!(reads[&c.seen].picture, reads[&c.corroborated].picture);
+    }
+
+    #[test]
+    fn a_single_observed_phase_separates_two_confirmed_starts() {
+        let mut reads = BTreeMap::new();
+        for (time, phase) in [
+            (14, "開始"),
+            (15, "開始"),
+            (16, "完了"),
+            (17, "開始"),
+            (18, "開始"),
+        ] {
+            reads.insert(
+                time,
+                screen(&format!("クエスト{phase}\n霧の港を照らす"), ""),
+            );
+        }
+        let found = cards(&reads);
+        assert_eq!(
+            found
+                .iter()
+                .map(|c| (c.first, c.seen, c.corroborated, c.status.phase))
+                .collect::<Vec<_>>(),
+            [(14, 15, 14, "開始"), (17, 18, 17, "開始")]
+        );
+    }
+
+    #[test]
+    fn phase_words_on_either_side_of_the_title_do_not_match_inside_it() {
+        let title = "任務完了の証・2";
+        let card = Card {
+            status: status("クエスト完了").unwrap(),
+            title: title.into(),
+            header: "クエスト完了".into(),
+            first: 16,
+            seen: 17,
+            corroborated: 16,
+        };
+        let mut events = vec![
+            event(15, 16, "クエスト完了『任務完了の証・2』"),
+            event(16, 16, "クエスト「任務完了の証・2」達成"),
+            event(16, 17, "クエスト完了：任務完了の証・2"),
+            event(16, 17, "任務完了の証・2をクリア"),
+            event(16, 16, "クエスト開始「任務完了の証・2」"),
+            event(16, 17, "クエスト完了 任務完了の証・20"),
+            event(16, 17, "クエスト 任務完了の証・2"),
+        ];
+        merge(
+            &mut events,
+            vec![(card, event(16, 17, "クエスト「任務完了の証・2」完了"))],
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.start, e.heading.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (16, "クエスト開始「任務完了の証・2」"),
+                (16, "クエスト完了 任務完了の証・20"),
+                (16, "クエスト 任務完了の証・2"),
+                (15, "クエスト「任務完了の証・2」完了")
+            ]
         );
     }
 
