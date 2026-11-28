@@ -8,7 +8,7 @@ use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-use crate::{analyze::Event, clock, editor};
+use crate::{analyze::Event, clock, editor, onset};
 
 const LIMIT: usize = 5000;
 
@@ -75,7 +75,8 @@ fn select(events: &[Event]) -> Vec<bool> {
             }
             // Keep an immediate, independently witnessed introduction after a
             // resume even when there are many later on-screen names.
-            let priority = editor::chapter_priority(event);
+            let priority =
+                editor::chapter_priority(event).max(u8::from(onset::has_conversation_intro(event)));
             if priority > 0
                 && !event.basis.trim().is_empty()
                 && resume.is_some_and(|t| event.start.abs_diff(t) <= 10)
@@ -249,5 +250,30 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn an_earlier_conversation_intro_keeps_its_later_outcome_in_a_full_description() {
+        let mut intro = event(21, "商人が船員に感謝する");
+        intro.seen = 90;
+        intro.evidence_image = "frames/00000090.jpg".into();
+        intro.basis = "商人が感謝の台詞を発する".into();
+        let mut place = event(20, "橋のたもと");
+        place.screen_label = Some("橋のたもと".into());
+        let mut events = [
+            event(0, "動画開始"),
+            place,
+            intro,
+            event(300, "遠くの山を見渡す"),
+            event(600, "夕暮れの港"),
+        ];
+        // The description can fit the location and just one of the two other
+        // entries. The distant view would win on spacing alone.
+        let cost = events.iter().map(line_cost).sum::<usize>();
+        let padding = LIMIT - cost + line_cost(&events[2]).min(line_cost(&events[3]));
+        events[1].heading.push_str(&"a".repeat(padding));
+        assert_eq!(select(&events), [true, true, true, false, true]);
+        events[2].start_image = None;
+        assert_eq!(select(&events), [true, true, false, true, true]);
     }
 }

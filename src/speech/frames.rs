@@ -16,13 +16,20 @@ pub(crate) fn sample(video: &Path, mut seconds: Vec<u64>) -> Result<BTreeMap<u64
     for group in seconds.chunk_by(|a, b| b - a <= 8) {
         let first = group[0];
         let end = group[group.len() - 1] + 1;
-        let select = group
-            .iter()
-            .map(|s| format!("eq(t,{s})"))
-            .collect::<Vec<_>>()
-            .join("+");
+        // trim on the integer playback grid already selects a contiguous
+        // interval. One eq() per second can exceed FFmpeg's expression depth.
+        let select = if end - first == group.len() as u64 {
+            String::new()
+        } else {
+            let tests = group
+                .iter()
+                .map(|s| format!("eq(t,{s})"))
+                .collect::<Vec<_>>()
+                .join("+");
+            format!(",select='{tests}'")
+        };
         let filter = format!(
-            "{},trim=start={first}:end={end},select='{select}',{}",
+            "{},trim=start={first}:end={end}{select},{}",
             media::PLAYBACK_FPS,
             media::FRAME_SCALE
         );
@@ -73,6 +80,37 @@ pub(crate) fn sample(video: &Path, mut seconds: Vec<u64>) -> Result<BTreeMap<u64
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn a_long_contiguous_seek_keeps_each_playback_second() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let video = dir.path().join("long.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x32:r=1:d=192",
+                "-vf",
+                "drawbox=color=blue:t=fill:enable='gte(t,140)'",
+                "-c:v",
+                "mpeg4",
+                "-g",
+                "8",
+            ])
+            .arg(&video)
+            .status()?;
+        ensure!(status.success(), "long interval fixture");
+        let seconds: Vec<_> = (8..=188).collect();
+        let frames = sample(&video, seconds.clone())?;
+        assert_eq!(frames.keys().copied().collect::<Vec<_>>(), seconds);
+        assert!(pixel(&frames[&139])?[0] > 230);
+        assert!(pixel(&frames[&140])?[2] > 230);
+        Ok(())
+    }
 
     #[test]
     fn seeking_keeps_the_held_vfr_picture_and_the_container_playback_origin() -> Result<()> {
