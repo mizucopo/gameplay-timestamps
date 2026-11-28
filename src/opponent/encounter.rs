@@ -21,7 +21,7 @@ enum Role {
     Other,
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, schemars::JsonSchema)]
 struct Reading {
     role: Role,
     literal: String,
@@ -208,6 +208,7 @@ struct Witness<'a> {
     bars: Vec<Meter>,
     located: Vec<Meter>,
     text: String,
+    read: Option<Reading>,
 }
 
 fn witness<'a>(
@@ -268,7 +269,42 @@ fn witness<'a>(
         bars,
         located,
         text,
+        read: read.cloned(),
     }))
+}
+
+// An ornamental rule under the speaker and a real HP bar can satisfy
+// exactly the same pixel and OCR checks. Examine the role of each original
+// picture separately, without disclosing the proposed enemy.
+fn opponent_on_screen(witness: &Witness<'_>, name: &str, analyzer: &Analyzer<'_>) -> bool {
+    let read = witness.read.clone().or_else(|| {
+        analyzer
+            .model
+            .infer::<Reading>(PROMPT, &witness.frame.jpeg)
+            .ok()
+    });
+    if let Some(r) = &read
+        && r.role == Role::Hud
+    {
+        return plausible_transcription(&r.literal, name);
+    }
+    let entrance = read.is_some_and(|r| r.role == Role::Entrance);
+    match analyzer
+        .model
+        .infer::<super::Picture>(super::PROMPT, &witness.frame.jpeg)
+    {
+        Ok(p) => match p.subject {
+            super::Subject::BossHud | super::Subject::EnemyHud | super::Subject::Combat => {
+                plausible_transcription(p.literal(), name)
+            }
+            // An unclassified image cannot corroborate a role of 'other'.
+            // A plausible introduction still has to pass the strict paired
+            // geometry and native name-location checks above.
+            super::Subject::Other => entrance,
+            _ => false,
+        },
+        Err(_) => false,
+    }
 }
 
 fn shared_meter(
@@ -395,6 +431,32 @@ fn history_screen(ocr: String) -> HistoryScreen {
     }) {
         return HistoryScreen::Loading;
     }
+    // A completed escape ends the encounter just as a victory or defeat
+    // does. Ignore escape options and quotes in a dialogue or records menu.
+    if ![
+        "会話ログ",
+        "戦績",
+        "履歴",
+        "図鑑",
+        "スキップ",
+        "オート",
+        "「",
+        "」",
+    ]
+    .iter()
+    .any(|s| words.contains(s))
+        && ocr.lines().any(|s| {
+            matches!(
+                compact(s)
+                    .trim_end_matches(['。', '！', '!'])
+                    .to_ascii_uppercase()
+                    .as_str(),
+                "逃走成功" | "逃走に成功した" | "撤退成功" | "ESCAPED" | "ESCAPESUCCESSFUL"
+            )
+        })
+    {
+        return HistoryScreen::Result;
+    }
     let event = Event {
         start: 0,
         seen: 0,
@@ -484,6 +546,78 @@ fn restart_since(
     error.map_or(Ok(false), Err)
 }
 
+fn unrelated_opening(text: &str) -> bool {
+    let words = compact(text);
+    crate::map::cursor_control(text)
+        || crate::quest::is_offer_screen(text)
+        || history_screen(text.into()) != HistoryScreen::Other
+        || [
+            "所持品",
+            "装備一覧",
+            "装備選択",
+            "装備を選択",
+            "図鑑",
+            "ステータス画面",
+            "会話ログ",
+            "会話を進める",
+            "オート送り",
+            "ロード画面",
+            "セーブデータ",
+            "スキップ",
+        ]
+        .iter()
+        .any(|s| words.contains(s))
+        || (words.contains("装備") && (words.contains("選択") || words.contains("閉じる")))
+        || text.lines().any(|line| {
+            line.split_once('「').is_some_and(|(speaker, quote)| {
+                valid_name(speaker.trim())
+                    && quote
+                        .trim_end()
+                        .strip_suffix('」')
+                        .is_some_and(|speech| speech.ends_with(['。', '！', '？', '!', '?']))
+            })
+        })
+}
+
+// A title and a field introduction must both survive the original UI check.
+// A battle banner may be punctuated just like speech. Use visible controls
+// or a speaker with quoted dialogue to identify an unrelated screen.
+fn opening_screen(frame: &Frame, analyzer: &Analyzer<'_>) -> Result<bool> {
+    if !analyzer.use_ocr {
+        return Ok(true);
+    }
+    Ok(!unrelated_opening(&crate::ocr::read(
+        &frame.jpeg,
+        analyzer.ocr_command,
+    )?))
+}
+
+fn opening(
+    frame: &Frame,
+    before: Option<&Frame>,
+    name: &str,
+    analyzer: &Analyzer<'_>,
+) -> Result<bool> {
+    let Ok(read) = analyzer.model.infer::<Reading>(PROMPT, &frame.jpeg) else {
+        return Ok(false);
+    };
+    if !matches!(read.role, Role::Title | Role::Entrance)
+        || (read.role == Role::Title && !same_name(&read.literal, name))
+        || !opening_screen(frame, analyzer)?
+    {
+        return Ok(false);
+    }
+    if read.role == Role::Title || !analyzer.use_ocr {
+        return Ok(true);
+    }
+    let Some(before) = before else {
+        return Ok(false);
+    };
+    let previous = crate::scene::Signal::measure(before, None)?;
+    let field = crate::scene::Signal::measure(frame, Some(&previous))?;
+    Ok((previous.dark || previous.mean < 20) && field.mean > previous.mean + 24)
+}
+
 fn confirm(
     event: &mut Event,
     name: &str,
@@ -515,46 +649,30 @@ fn confirm(
     };
     let first_reading = analyzer.model.infer::<Reading>(PROMPT, &first.jpeg).ok();
     let first_role = first_reading.as_ref().map(|r| r.role);
-    let title = if first_role == Some(Role::Title) {
+    let named_title = if first_role == Some(Role::Title) {
         first_reading
             .as_ref()
             .is_some_and(|r| same_name(&r.literal, name))
     } else {
         analyzer.use_ocr
-            && !matches!(first_role, Some(Role::Hud))
+            && !matches!(first_role, Some(Role::Hud | Role::Other))
             && standalone_title(first, name, analyzer).unwrap_or(false)
     };
+    let title = named_title && opening_screen(first, analyzer).unwrap_or(false);
     let mut onset = event.seen;
     let mut intro = title;
     if event.start < event.seen
         && let Some(start) = frames.get(&event.start)
+        && opening(
+            start,
+            frames.get(&event.start.saturating_sub(1)),
+            name,
+            analyzer,
+        )
+        .unwrap_or(false)
     {
-        let begins = if analyzer.use_ocr {
-            let words = crate::ocr::read(&start.jpeg, analyzer.ocr_command).unwrap_or_default();
-            let fade = frames
-                .get(&event.start.saturating_sub(1))
-                .map(|f| crate::scene::Signal::measure(f, None))
-                .transpose()?;
-            let field = crate::scene::Signal::measure(start, fade.as_ref())?;
-            fade.is_some_and(|p| (p.dark || p.mean < 20) && field.mean > p.mean + 24)
-                && !words.lines().any(|s| {
-                    s.contains(['。', '！', '？', '「', '」'])
-                        || s.contains("スキップ")
-                        || s.contains("会話")
-                })
-        } else {
-            analyzer
-                .model
-                .infer::<Reading>(PROMPT, &start.jpeg)
-                .is_ok_and(|r| {
-                    r.role == Role::Entrance
-                        || (r.role == Role::Title && same_name(&r.literal, name))
-                })
-        };
-        if begins {
-            onset = event.start;
-            intro = true;
-        }
+        onset = event.start;
+        intro = true;
     }
     if title {
         // The title card has no HP. Wait through a short intro or tutorial
@@ -593,6 +711,8 @@ fn confirm(
                 .next()
                 .is_none()
             && let Some(shared) = shared_meter(earlier, &current, name, analyzer)?
+            && opponent_on_screen(earlier, name, analyzer)
+            && opponent_on_screen(&current, name, analyzer)
             && !restart_since(video, earlier.frame.second, second, analyzer, history)?
         {
             let a = earlier.frame;

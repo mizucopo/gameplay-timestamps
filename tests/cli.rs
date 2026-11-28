@@ -82,7 +82,14 @@ fn model() -> Result<(String, thread::JoinHandle<Result<usize>>)> {
                 let properties = &body["response_format"]["json_schema"]["schema"]["properties"];
                 if properties.get("gauge_y").is_some() {
                     if body["model"] == "unreliable-hud-position" {
-                        json!({"role":"entrance","literal":"","gauge_x":50,"gauge_y":50})
+                        let (role, name) = if b > 65 && r < 55 {
+                            ("other", "")
+                        } else if r > 120 && (55..115).contains(&g) && b < 75 {
+                            ("title", "蒼の騎士")
+                        } else {
+                            ("entrance", "")
+                        };
+                        json!({"role":role,"literal":name,"gauge_x":50,"gauge_y":50})
                     } else if g > 140 && b > 140 {
                         json!({"role":"hud","literal":"蒼の騎士","gauge_x":50,"gauge_y":18})
                     } else if r > 170 && b > 170 && g < 70 {
@@ -333,8 +340,7 @@ fn silent_recording_keeps_distinct_starts_and_links_later_evidence() -> Result<(
                 "--no-ocr",
                 "--no-audio",
             ])
-            .arg("--inference-cache")
-            .arg(tmp.path().join("cache"))
+            .env("GAMEPLAY_INFERENCE_CACHE", tmp.path().join("cache"))
             .arg("-o")
             .arg(&out)
             .output()?;
@@ -584,13 +590,21 @@ fn native_enemy_name_must_be_attached_to_a_stable_meter_even_with_a_wrong_model_
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir()?;
     let video = tmp.path().join("hud.mp4");
+    // The speaker's divider deliberately has the same geometry as the enemy HP.
+    // The model mistakes the named inventory entry for a boss title.
     let filter = [
-        "drawbox=x=16:y=11:w=64:h=2:color=white:t=fill",
-        "drawbox=x=3:y=35:w=4:h=3:color=lime:t=fill:enable='between(t,2,3)'",
-        "drawbox=x=11:y=35:w=4:h=3:color=lime:t=fill:enable='between(t,2,3)'",
-        "drawbox=x=41:y=9:w=4:h=3:color=lime:t=fill:enable='between(t,5,6)+between(t,8,9)'",
-        "drawbox=x=52:y=9:w=4:h=3:color=lime:t=fill:enable='between(t,5,6)+between(t,8,9)'",
-        "drawbox=x=85:y=45:w=5:h=6:color=red:t=fill:enable='eq(t,3)+eq(t,6)+eq(t,9)'",
+        "drawbox=color=0x203870:t=fill:enable='between(t,2,3)'",
+        "drawbox=color=0x945b30:t=fill:enable='between(t,5,6)'",
+        "drawbox=color=0x4a7450:t=fill:enable='eq(t,9)+eq(t,24)+eq(t,31)'",
+        "drawbox=color=gray:t=fill:enable='between(t,26,27)'",
+        "drawbox=color=0xcdace8:t=fill:enable='between(t,33,34)'",
+        "drawbox=x=16:y=38:w=64:h=2:color=white:t=fill:enable='between(t,2,3)'",
+        "drawbox=x=24:y=36:w=4:h=3:color=lime:t=fill:enable='between(t,2,3)'",
+        "drawbox=x=34:y=36:w=4:h=3:color=lime:t=fill:enable='between(t,2,3)'",
+        "drawbox=x=16:y=11:w=64:h=2:color=white:t=fill:enable='between(t,7,8)+between(t,19,20)+between(t,22,23)+between(t,28,29)+gte(t,35)'",
+        "drawbox=x=41:y=9:w=4:h=3:color=lime:t=fill:enable='between(t,7,8)+between(t,19,20)+between(t,22,23)+between(t,28,29)+gte(t,35)'",
+        "drawbox=x=52:y=9:w=4:h=3:color=lime:t=fill:enable='between(t,7,8)+between(t,19,20)+between(t,22,23)+between(t,28,29)+gte(t,35)'",
+        "drawbox=x=85:y=45:w=5:h=6:color=red:t=fill:enable='eq(t,3)+eq(t,8)+eq(t,20)+eq(t,23)+eq(t,29)+eq(t,36)'",
     ]
     .join(",");
     ensure!(
@@ -602,7 +616,7 @@ fn native_enemy_name_must_be_attached_to_a_stable_meter_even_with_a_wrong_model_
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=black:s=96x54:r=1:d=10",
+                "color=c=black:s=96x54:r=1:d=37",
                 "-vf",
                 &filter,
                 "-c:v",
@@ -620,6 +634,10 @@ import subprocess,sys
 data=subprocess.check_output(["ffmpeg","-v","error","-i","pipe:0","-f","rawvideo","-pix_fmt","rgb24","pipe:1"],input=sys.stdin.buffer.read())
 if sum(g>100 and g>r+40 and g>b+40 for r,g,b in zip(data[::3],data[1::3],data[2::3]))>=19:
     print("蒼の騎士")
+r,g,b=data[:3]
+if r>120 and 55<g<115 and b<75: print("人物図鑑　所持品\n蒼の騎士")
+if 55<r<95 and 96<g<135 and 55<b<105: print("逃走成功")
+if 185<r<225 and 150<g<195 and b>210: print("戦闘開始！")
 "#,
     )?;
     fs::set_permissions(&ocr, fs::Permissions::from_mode(0o755))?;
@@ -675,16 +693,36 @@ if sum(g>100 and g>r+40 and g>b+40 for r,g,b in zip(data[::3],data[1::3],data[2:
     let mut events = vec![
         json!({"start":0,"seen":0,"heading":"動画開始","basis":"録画の先頭","ocr":"","start_image":"frames/00000000.jpg","evidence_image":"frames/00000000.jpg"}),
     ];
-    for sec in [2, 5, 8] {
-        let path = format!("frames/{sec:08}.jpg");
-        events.push(json!({"start":sec,"seen":sec,"heading":"蒼の騎士戦開始","basis":"敵名・体力ゲージを照合","ocr":format!("{sec} 蒼の騎士"),"screen_label":"蒼の騎士","start_image":path,"evidence_image":path}));
+    for (start, seen) in [
+        (2, 2),
+        (5, 5),
+        (5, 7),
+        (19, 19),
+        (22, 22),
+        (26, 28),
+        (33, 35),
+    ] {
+        events.push(json!({"start":start,"seen":seen,"heading":"蒼の騎士戦開始","basis":"敵名・体力ゲージを照合","ocr":format!("{seen} 蒼の騎士"),"screen_label":"蒼の騎士","start_image":format!("frames/{start:08}.jpg"),"evidence_image":format!("frames/{seen:08}.jpg")}));
     }
     fs::write(obs.join("events.json"), serde_json::to_vec(&events)?)?;
     run("checked")?;
     assert_eq!(
         fs::read_to_string(tmp.path().join("checked/timestamps.txt"))?,
-        "0:00 動画開始\n0:05 蒼の騎士戦開始\n"
+        "0:00 動画開始\n0:07 蒼の騎士戦開始\n0:19 蒼の騎士戦開始\n0:26 蒼の騎士戦開始\n0:33 蒼の騎士戦開始\n"
     );
+    let evidence = fs::read_to_string(tmp.path().join("checked/evidence.jsonl"))?;
+    let rows = evidence
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    for (row, (start, seen)) in rows
+        .iter()
+        .zip([(0, 0), (7, 7), (19, 19), (26, 28), (33, 35)])
+    {
+        assert_eq!(row["start_image"], format!("frames/{start:08}.jpg"));
+        assert_eq!(row["evidence_image"], format!("frames/{seen:08}.jpg"));
+        assert_eq!(row["seen"], seen);
+    }
     let mut stop =
         std::net::TcpStream::connect(base.trim_start_matches("http://").trim_end_matches("/v1"))?;
     stop.write_all(b"GET /stop HTTP/1.1\r\n\r\n")?;

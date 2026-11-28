@@ -66,7 +66,7 @@ struct Args {
     #[arg(long, env = "GAMEPLAY_OCR_COMMAND", conflicts_with = "no_ocr")]
     ocr_command: Option<PathBuf>,
     /// 同一モデル・同一入力の推論応答を再利用するローカルディレクトリ
-    #[arg(long)]
+    #[arg(long, env = "GAMEPLAY_INFERENCE_CACHE")]
     inference_cache: Option<PathBuf>,
     /// 日本語OCRを停止する
     #[arg(long)]
@@ -114,7 +114,18 @@ fn generate(args: Args) -> Result<PathBuf> {
     let work = tempfile::Builder::new()
         .prefix(".gameplay-timestamps-")
         .tempdir_in(parent)?;
-    let model = model::Model::connect(&args.api_base, args.model, args.inference_cache.as_deref())?;
+    // Repeated native frames and prompts can occur in several passes of the
+    // same recording. Keep those answers for this run even without a shared cache.
+    let temporary_responses = args
+        .inference_cache
+        .is_none()
+        .then(tempfile::tempdir)
+        .transpose()?;
+    let response_cache = args
+        .inference_cache
+        .as_deref()
+        .or_else(|| temporary_responses.as_ref().map(|dir| dir.path()));
+    let model = model::Model::connect(&args.api_base, args.model, response_cache)?;
     let dictionary = dictionary::load(
         &args.game,
         &args.edition,
