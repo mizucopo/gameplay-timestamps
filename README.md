@@ -43,7 +43,9 @@ llama-server -m /path/to/Qwen3VL-8B-Instruct-Q4_K_M.gguf \
 
 複数の画面で地名表示や依頼票の名称を確かめた場合、`evidence.jsonl` の `screen_label` に読み取った表記を保存します。
 
-映像と中間画像の処理にはループバック上のモデルを使います。外部の辞書検索に使う情報は作品名・版・照会語です。[作品別辞書と OCR](docs/dictionary.md)・[実録画の採点方法](docs/evaluation.md)・[実録画による評価](docs/evaluation-results.md)・[vLLM の画像入力](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
+映像と中間画像の処理にはループバック上のモデルを使います。外部の辞書検索に使う情報は作品名・版・照会語です。[作品別辞書と OCR](docs/dictionary.md)・[vLLM の画像入力](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
+
+開発用7作品で音声・辞書を併用したとき、手作業の見本153件中52件に対応しました。設定を固定して試した別録画では、連続調査で確認した7件中1件に対応しました。[作品別の全29条件の結果](docs/evaluation-comparison.md)・[頭出しの実例と失敗例](docs/evaluation-results.md)・[採点方法](docs/evaluation.md)
 
 ### Apple Silicon Mac で日本語の発話を使う
 
